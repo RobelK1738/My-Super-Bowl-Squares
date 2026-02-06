@@ -1,4 +1,10 @@
-import React, { useState, useCallback, useMemo } from "react";
+import React, {
+  useState,
+  useCallback,
+  useMemo,
+  useEffect,
+  useRef,
+} from "react";
 import {
   Trophy,
   Shuffle,
@@ -18,33 +24,138 @@ import { EditModal } from "./components/EditModal";
 import { AuthModal } from "./components/AuthModal";
 import { INITIAL_COLS, INITIAL_ROWS } from "./constants";
 import { GridCell } from "./types";
+import { isSupabaseConfigured, supabase } from "./supabaseClient";
+
+const STORAGE_KEY = "sb-lx-squares-v1";
+const BOARD_ID = import.meta.env.VITE_BOARD_ID || "default";
+
+type PersistedState = {
+  version: 1;
+  pricePerSquare: number;
+  isLocked: boolean;
+  rowLabels: number[];
+  colLabels: number[];
+  grid: GridCell[][];
+};
+
+const normalizePersistedState = (payload: unknown): PersistedState | null => {
+  if (!payload || typeof payload !== "object") return null;
+  const data = payload as Partial<PersistedState>;
+  const pricePerSquare =
+    typeof data.pricePerSquare === "number" &&
+    Number.isFinite(data.pricePerSquare)
+      ? data.pricePerSquare
+      : 3;
+
+  return {
+    version: 1,
+    pricePerSquare,
+    isLocked: typeof data.isLocked === "boolean" ? data.isLocked : false,
+    rowLabels: coerceLabels(data.rowLabels) ?? INITIAL_ROWS,
+    colLabels: coerceLabels(data.colLabels) ?? INITIAL_COLS,
+    grid: coerceGrid(data.grid) ?? createEmptyGrid(),
+  };
+};
+
+const createEmptyGrid = (): GridCell[][] =>
+  Array(10)
+    .fill(null)
+    .map((_, r) =>
+      Array(10)
+        .fill(null)
+        .map((_, c) => ({
+          row: r,
+          col: c,
+          player: null,
+          status: "empty" as const,
+        })),
+    );
+
+const coerceLabels = (value: unknown): number[] | null => {
+  if (!Array.isArray(value) || value.length !== 10) return null;
+  if (!value.every((n) => typeof n === "number" && Number.isFinite(n))) {
+    return null;
+  }
+  return value;
+};
+
+const coerceGrid = (value: unknown): GridCell[][] | null => {
+  if (!Array.isArray(value) || value.length !== 10) return null;
+  const rows: GridCell[][] = [];
+  for (let r = 0; r < 10; r += 1) {
+    const row = value[r];
+    if (!Array.isArray(row) || row.length !== 10) return null;
+    const nextRow: GridCell[] = [];
+    for (let c = 0; c < 10; c += 1) {
+      const cell = row[c] as Partial<GridCell> | null;
+      const status =
+        cell?.status === "approved" ||
+        cell?.status === "pending" ||
+        cell?.status === "empty"
+          ? cell.status
+          : "empty";
+      nextRow.push({
+        row: r,
+        col: c,
+        player: typeof cell?.player === "string" ? cell.player : null,
+        status,
+      });
+    }
+    rows.push(nextRow);
+  }
+  return rows;
+};
+
+const loadPersistedState = (): PersistedState | null => {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return normalizePersistedState(parsed);
+  } catch (error) {
+    console.warn("Failed to load saved board state.", error);
+    return null;
+  }
+};
 
 const App: React.FC = () => {
+  const [persistedState] = useState(() => loadPersistedState());
+  const [isRemoteReady, setIsRemoteReady] = useState(!isSupabaseConfigured);
+  const skipNextSaveRef = useRef(false);
+  const lastSavedRef = useRef<string | null>(null);
+  const seedRef = useRef<PersistedState>(
+    normalizePersistedState(persistedState) ?? {
+      version: 1,
+      pricePerSquare: 3,
+      isLocked: false,
+      rowLabels: INITIAL_ROWS,
+      colLabels: INITIAL_COLS,
+      grid: createEmptyGrid(),
+    },
+  );
   // Game Configuration State
   const [homeTeam] = useState("Seahawks");
   const [awayTeam] = useState("Patriots");
-  const [pricePerSquare, setPricePerSquare] = useState(3);
-  const [isLocked, setIsLocked] = useState(false);
+  const [pricePerSquare, setPricePerSquare] = useState(
+    () => persistedState?.pricePerSquare ?? 3,
+  );
+  const [isLocked, setIsLocked] = useState(
+    () => persistedState?.isLocked ?? false,
+  );
   const [adminPasscode, setAdminPasscode] = useState<string | null>(null);
 
   // Board State
-  const [rowLabels, setRowLabels] = useState<number[]>(INITIAL_ROWS);
-  const [colLabels, setColLabels] = useState<number[]>(INITIAL_COLS);
+  const [rowLabels, setRowLabels] = useState<number[]>(
+    () => persistedState?.rowLabels ?? INITIAL_ROWS,
+  );
+  const [colLabels, setColLabels] = useState<number[]>(
+    () => persistedState?.colLabels ?? INITIAL_COLS,
+  );
 
   // 10x10 grid state
   const [grid, setGrid] = useState<GridCell[][]>(
-    Array(10)
-      .fill(null)
-      .map((_, r) =>
-        Array(10)
-          .fill(null)
-          .map((_, c) => ({
-            row: r,
-            col: c,
-            player: null,
-            status: "empty",
-          })),
-      ),
+    () => persistedState?.grid ?? createEmptyGrid(),
   );
 
   // UI State
@@ -57,6 +168,130 @@ const App: React.FC = () => {
 
   const adminPasscodeEnv = import.meta.env.VITE_ADMIN_PASSCODE;
   const isAdmin = !!adminPasscodeEnv && adminPasscode === adminPasscodeEnv;
+
+  const applyPersistedState = useCallback((next: PersistedState) => {
+    setPricePerSquare(next.pricePerSquare);
+    setIsLocked(next.isLocked);
+    setRowLabels(next.rowLabels);
+    setColLabels(next.colLabels);
+    setGrid(next.grid);
+  }, []);
+
+  useEffect(() => {
+    if (!isSupabaseConfigured || !supabase) return;
+    let cancelled = false;
+
+    const handleRemotePayload = (payload: unknown) => {
+      const normalized = normalizePersistedState(payload);
+      if (!normalized) return;
+      const nextString = JSON.stringify(normalized);
+      if (nextString === lastSavedRef.current) return;
+      skipNextSaveRef.current = true;
+      applyPersistedState(normalized);
+    };
+
+    const loadRemoteState = async () => {
+      const { data, error } = await supabase
+        .from("board_state")
+        .select("data")
+        .eq("id", BOARD_ID)
+        .maybeSingle();
+
+      if (cancelled) return;
+
+      if (error) {
+        console.warn("Failed to load board from Supabase.", error);
+        setIsRemoteReady(true);
+        return;
+      }
+
+      if (data?.data) {
+        handleRemotePayload(data.data);
+      } else {
+        await supabase.from("board_state").upsert({
+          id: BOARD_ID,
+          data: seedRef.current,
+        });
+      }
+
+      setIsRemoteReady(true);
+    };
+
+    loadRemoteState();
+
+    const channel = supabase
+      .channel(`board-state:${BOARD_ID}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "board_state",
+          filter: `id=eq.${BOARD_ID}`,
+        },
+        (payload) => handleRemotePayload(payload.new?.data),
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "board_state",
+          filter: `id=eq.${BOARD_ID}`,
+        },
+        (payload) => handleRemotePayload(payload.new?.data),
+      )
+      .subscribe();
+
+    return () => {
+      cancelled = true;
+      supabase.removeChannel(channel);
+    };
+  }, [applyPersistedState]);
+
+  useEffect(() => {
+    if (isSupabaseConfigured) return;
+    const payload: PersistedState = {
+      version: 1,
+      pricePerSquare,
+      isLocked,
+      rowLabels,
+      colLabels,
+      grid,
+    };
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    } catch (error) {
+      console.warn("Failed to save board state.", error);
+    }
+  }, [pricePerSquare, isLocked, rowLabels, colLabels, grid]);
+
+  useEffect(() => {
+    if (!isSupabaseConfigured || !supabase || !isRemoteReady) return;
+    if (skipNextSaveRef.current) {
+      skipNextSaveRef.current = false;
+      return;
+    }
+    const payload: PersistedState = {
+      version: 1,
+      pricePerSquare,
+      isLocked,
+      rowLabels,
+      colLabels,
+      grid,
+    };
+    const payloadString = JSON.stringify(payload);
+    if (payloadString === lastSavedRef.current) return;
+    lastSavedRef.current = payloadString;
+    supabase
+      .from("board_state")
+      .upsert({ id: BOARD_ID, data: payload })
+      .then(({ error }) => {
+        if (error) {
+          console.warn("Failed to save board to Supabase.", error);
+        }
+      });
+  }, [pricePerSquare, isLocked, rowLabels, colLabels, grid, isRemoteReady]);
 
   // Derived State
   const totalEntries = useMemo(() => {
@@ -139,19 +374,7 @@ const App: React.FC = () => {
         "Are you sure you want to clear the entire board? This cannot be undone.",
       )
     ) {
-      // Create a completely new grid array
-      const newGrid = Array(10)
-        .fill(null)
-        .map((_, r) =>
-          Array(10)
-            .fill(null)
-            .map((_, c) => ({
-              row: r,
-              col: c,
-              player: null,
-              status: "empty" as const,
-            })),
-        );
+      const newGrid = createEmptyGrid();
       setGrid(newGrid);
       setRowLabels(INITIAL_ROWS);
       setColLabels(INITIAL_COLS);

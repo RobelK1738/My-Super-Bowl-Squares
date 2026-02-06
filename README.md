@@ -38,9 +38,48 @@ A single-page React + Vite app for running a classic 10x10 Super Bowl squares bo
   - Shuffles the `rowLabels` and `colLabels` arrays in place.
 
 **State & Persistence**
-- All state lives in memory inside React state.
-- There is no backend and no persistence across page reloads.
+- By default, app state is persisted in `localStorage` in the browser.
+- This keeps data across reloads on the same device/browser only.
+- For shared persistence across devices/users, configure Supabase (see below).
 - Admin login is client-side only and uses a hardcoded passcode.
+
+**Shared Persistence (Supabase)**
+1. Create a Supabase project.
+2. Create the table:
+   ```sql
+   create table if not exists public.board_state (
+     id text primary key,
+     data jsonb not null,
+     updated_at timestamp with time zone default now()
+   );
+   ```
+3. (Recommended) Enable Realtime for `board_state` in Supabase:
+   - Database → Replication → Enable `board_state`.
+4. Disable RLS for the table **or** add open policies (anon access):
+   ```sql
+   alter table public.board_state enable row level security;
+
+   create policy "board_state_read"
+     on public.board_state for select
+     using (true);
+
+   create policy "board_state_write"
+     on public.board_state for insert
+     with check (true);
+
+   create policy "board_state_update"
+     on public.board_state for update
+     using (true);
+   ```
+5. Add these to `.env.local`:
+   - `VITE_SUPABASE_URL=...`
+   - `VITE_SUPABASE_ANON_KEY=...`
+   - `VITE_BOARD_ID=default` (optional; use a different ID for another board)
+
+**Security Note**
+- With only a client-side passcode, anyone with the URL can still write if your
+  Supabase policies are open. For real auth/authorization, add Supabase Auth or
+  a server-side API.
 
 **Files To Know**
 - `App.tsx`: main app state, admin actions, and layout.
