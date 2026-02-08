@@ -23,6 +23,7 @@ import { GridBoard } from "./components/GridBoard";
 import { EditModal } from "./components/EditModal";
 import { AuthModal } from "./components/AuthModal";
 import { WinnerModal } from "./components/WinnerModal";
+import { SquareDetailsModal } from "./components/SquareDetailsModal";
 import { INITIAL_COLS, INITIAL_ROWS, NFL_TEAMS } from "./constants";
 import { buildSquareOdds } from "./services/squareOddsService";
 import {
@@ -50,6 +51,7 @@ const DEFAULT_GAME_DATE = "2026-02-08";
 const SCORE_ENTRY_HOUR = 22;
 const SCORE_ENTRY_MINUTE = 0;
 const LIVE_SNAPSHOT_STALE_AFTER_MS = 1000 * 90;
+const TOP_LEADERS_LIMIT = 10;
 const ENABLE_LOCAL_LIVE_SIMULATOR =
   import.meta.env.DEV &&
   (
@@ -90,6 +92,13 @@ type PersistedState = {
 };
 
 type SimulatorEventTeam = "home" | "away" | "neutral";
+
+type PlayerLeaderboardEntry = {
+  playerKey: string;
+  playerName: string;
+  totalWinProbability: number;
+  squareCount: number;
+};
 
 const clamp = (value: number, min: number, max: number): number =>
   Math.min(max, Math.max(min, value));
@@ -360,6 +369,10 @@ const App: React.FC = () => {
 
   // UI State
   const [activeCell, setActiveCell] = useState<{
+    row: number;
+    col: number;
+  } | null>(null);
+  const [selectedSquare, setSelectedSquare] = useState<{
     row: number;
     col: number;
   } | null>(null);
@@ -1120,6 +1133,83 @@ const App: React.FC = () => {
     !isUsingLocalLiveSimulator &&
     liveSnapshotAgeMs !== null &&
     liveSnapshotAgeMs > LIVE_SNAPSHOT_STALE_AFTER_MS;
+  const shouldShowLeadersPanel = isLocked && !gameResult;
+  const leadersStatusMessage = realtimeSquareOdds
+    ? "Realtime leaderboard: rankings update continuously as the live model moves."
+    : "Smart-model leaderboard: rankings use current square win probabilities.";
+  const playerLeaders = useMemo(() => {
+    const players = new Map<string, PlayerLeaderboardEntry>();
+
+    for (let rowIndex = 0; rowIndex < grid.length; rowIndex += 1) {
+      const row = grid[rowIndex];
+      for (let colIndex = 0; colIndex < row.length; colIndex += 1) {
+        const cell = row[colIndex];
+        const rawPlayer = cell.player?.trim();
+        if (!rawPlayer) continue;
+
+        const playerKey = normalizeText(rawPlayer);
+        if (!playerKey) continue;
+
+        const oddsValue = boardSquareOdds?.[rowIndex]?.[colIndex];
+        const squareWinProbability =
+          typeof oddsValue === "number" && Number.isFinite(oddsValue)
+            ? oddsValue
+            : 1;
+
+        const existing = players.get(playerKey);
+        if (!existing) {
+          players.set(playerKey, {
+            playerKey,
+            playerName: rawPlayer,
+            totalWinProbability: squareWinProbability,
+            squareCount: 1,
+          });
+          continue;
+        }
+
+        existing.totalWinProbability += squareWinProbability;
+        existing.squareCount += 1;
+      }
+    }
+
+    const allEntries = Array.from(players.values());
+    const sorted = [...allEntries].sort((left, right) => {
+      if (Math.abs(right.totalWinProbability - left.totalWinProbability) > 0.0001) {
+        return right.totalWinProbability - left.totalWinProbability;
+      }
+      if (right.squareCount !== left.squareCount) {
+        return right.squareCount - left.squareCount;
+      }
+      return left.playerName.localeCompare(right.playerName);
+    });
+
+    return {
+      playerCount: allEntries.length,
+      topFive: sorted.slice(0, TOP_LEADERS_LIMIT),
+    };
+  }, [boardSquareOdds, grid]);
+
+  const selectedSquareCell = selectedSquare
+    ? grid[selectedSquare.row]?.[selectedSquare.col] ?? null
+    : null;
+  const selectedSquareNumber = selectedSquare
+    ? selectedSquare.row * 10 + selectedSquare.col + 1
+    : null;
+  const selectedSquareWinProbability =
+    selectedSquare && !gameResult
+      ? (() => {
+          const oddsValue = boardSquareOdds?.[selectedSquare.row]?.[selectedSquare.col];
+          return typeof oddsValue === "number" && Number.isFinite(oddsValue)
+            ? oddsValue
+            : null;
+        })()
+      : null;
+  const selectedSquareHomeDigit = selectedSquare
+    ? rowLabels[selectedSquare.row] ?? null
+    : null;
+  const selectedSquareAwayDigit = selectedSquare
+    ? colLabels[selectedSquare.col] ?? null
+    : null;
 
   // Actions
   const handleShuffle = useCallback(() => {
@@ -1137,8 +1227,12 @@ const App: React.FC = () => {
   }, [rowLabels, colLabels, isAdmin, isLocked]);
 
   const handleSquareClick = (row: number, col: number) => {
-    if (!isAdmin) return;
-    setActiveCell({ row, col });
+    setSelectedSquare({ row, col });
+  };
+
+  const handleManageSquareFromDetails = () => {
+    if (!selectedSquare || !isAdmin) return;
+    setActiveCell(selectedSquare);
     setIsEditModalOpen(true);
   };
 
@@ -1195,6 +1289,7 @@ const App: React.FC = () => {
       setHomeFinalScore("");
       setAwayFinalScore("");
       setFinalizeError(null);
+      setSelectedSquare(null);
     }
   };
 
@@ -1983,7 +2078,7 @@ const App: React.FC = () => {
               )}
               {isAdmin && (
                 <p className="text-emerald-400 text-sm">
-                  You are in admin mode. Click any square to assign it.
+                  You are in admin mode. Click any square to view details or manage it.
                 </p>
               )}
               {shouldShowSquareOdds && (
@@ -2074,6 +2169,58 @@ const App: React.FC = () => {
             </div>
           </div>
 
+          {shouldShowLeadersPanel && (
+            <div className="mb-5 rounded-xl border border-slate-700/80 bg-slate-900/70 p-4 sm:p-5">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+                <div>
+                  <h3 className="text-sm font-bold uppercase tracking-wider text-slate-200">
+                    Top 5 Leading Players
+                  </h3>
+                  <p className="mt-1 text-xs text-emerald-300">
+                    {leadersStatusMessage}
+                  </p>
+                </div>
+                <p className="text-[11px] text-slate-500">
+                  {playerLeaders.playerCount > 0
+                    ? `Showing ${Math.min(TOP_LEADERS_LIMIT, playerLeaders.playerCount)} of ${playerLeaders.playerCount} claimed players.`
+                    : "No claimed squares yet."}
+                </p>
+              </div>
+
+              {playerLeaders.playerCount === 0 ? (
+                <div className="mt-3 rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-3 text-sm text-slate-400">
+                  Claim squares to populate leaderboard rankings.
+                </div>
+              ) : (
+                <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-5">
+                  {playerLeaders.topFive.map((entry, index) => (
+                    <div
+                      key={entry.playerKey}
+                      className="rounded-lg border border-slate-700 bg-slate-950/80 px-3 py-3"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <p className="text-sm font-semibold text-white break-words">
+                          {entry.playerName}
+                        </p>
+                        <span
+                          className="rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide bg-emerald-900/60 text-emerald-300 border border-emerald-700/70"
+                        >
+                          #{index + 1}
+                        </span>
+                      </div>
+                      <p className="mt-2 text-xl font-black text-emerald-300">
+                        {entry.totalWinProbability.toFixed(2)}%
+                      </p>
+                      <p className="text-[11px] text-slate-500">
+                        {entry.squareCount} square{entry.squareCount === 1 ? "" : "s"}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           <GridBoard
             rowLabels={rowLabels}
             colLabels={colLabels}
@@ -2122,6 +2269,23 @@ const App: React.FC = () => {
         }
         cellCoords={activeCell}
         isAdmin={isAdmin}
+      />
+
+      <SquareDetailsModal
+        isOpen={selectedSquare !== null}
+        onClose={() => setSelectedSquare(null)}
+        squareNumber={selectedSquareNumber}
+        playerName={selectedSquareCell?.player ?? null}
+        rowDigit={selectedSquareHomeDigit}
+        colDigit={selectedSquareAwayDigit}
+        homeTeamName={homeTeam}
+        awayTeamName={awayTeam}
+        winPercentage={selectedSquareWinProbability}
+        areDigitsRevealed={isLocked}
+        areOddsVisible={!gameResult}
+        cellStatus={selectedSquareCell?.status ?? "empty"}
+        isAdmin={isAdmin}
+        onManageSquare={isAdmin ? handleManageSquareFromDetails : undefined}
       />
 
       <AuthModal

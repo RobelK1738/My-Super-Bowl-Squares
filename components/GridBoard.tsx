@@ -124,8 +124,8 @@ export const GridBoard: React.FC<GridBoardProps> = ({
     return (
       <button
         key={`${rIndex}-${cIndex}`}
+        type="button"
         onClick={() => onSquareClick(rIndex, cIndex)}
-        disabled={!isAdmin && !hasPlayer}
         className={`
           w-full aspect-square relative group transition-all duration-200 rounded-lg
           flex flex-col items-center justify-center p-1 border shadow-sm
@@ -136,7 +136,7 @@ export const GridBoard: React.FC<GridBoardProps> = ({
                 : "bg-emerald-900/20 border-emerald-700/50 hover:bg-emerald-900/30"
               : "bg-slate-800 border-slate-700 hover:bg-slate-750 hover:border-slate-500"
           }
-          ${!isAdmin && !hasPlayer ? "cursor-default" : "cursor-pointer"}
+          cursor-pointer
           ${isWinner ? "ring-2 ring-amber-400 ring-offset-1 ring-offset-slate-900" : ""}
         `}
       >
