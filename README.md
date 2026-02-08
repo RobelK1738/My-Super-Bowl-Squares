@@ -8,6 +8,7 @@ A single-page React + Vite app for running a classic 10x10 Super Bowl squares bo
 - Numbers are hidden until the board is locked.
 - Admin final-score workflow that computes and announces the winner.
 - Pot size is computed from filled squares and the per-square cost.
+- Realtime heatmap updates after kickoff (score, play events, penalties, clock, and commentary sentiment).
 
 **How The App Works**
 1. The board starts with 10x10 empty squares and row/column labels from `0-9`.
@@ -109,6 +110,7 @@ Prerequisite: Node.js
    - `GEMINI_API_KEY=YOUR_KEY`
    - `VITE_ADMIN_PASSCODE=YOUR_PASSCODE`
    - Optional: `VITE_GAME_DATE=2026-02-08` (defaults to this date if omitted; final-score entry opens at 10:00 PM local time)
+   - Optional: `VITE_NFL_EVENT_ID=401671813` (force a specific ESPN event ID for realtime odds updates)
    - Optional: `VITE_USE_LOCAL_SQLITE=false` to disable SQLite in local dev
 3. Run the dev server:
    `npm run dev`

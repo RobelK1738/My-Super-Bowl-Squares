@@ -25,8 +25,19 @@ import { AuthModal } from "./components/AuthModal";
 import { WinnerModal } from "./components/WinnerModal";
 import { INITIAL_COLS, INITIAL_ROWS } from "./constants";
 import { buildSquareOdds } from "./services/squareOddsService";
-import { GameResult, GridCell, SquareOddsComputationResult } from "./types";
+import {
+  GameResult,
+  GridCell,
+  LiveGameSnapshot,
+  RealtimeSquareOddsComputationResult,
+  SquareOddsComputationResult,
+} from "./types";
 import { isSupabaseConfigured, supabase } from "./supabaseClient";
+import {
+  fetchLiveGameSnapshot,
+  getLivePollIntervalMs,
+} from "./services/liveGameFeedService";
+import { buildRealtimeSquareOdds } from "./services/realtimeSquareOddsService";
 
 const STORAGE_KEY = "sb-lx-squares-v1";
 const BOARD_ID = import.meta.env.VITE_BOARD_ID || "default";
@@ -36,6 +47,9 @@ const SQLITE_API_BASE = "/api/board-state";
 const DEFAULT_GAME_DATE = "2026-02-08";
 const SCORE_ENTRY_HOUR = 22;
 const SCORE_ENTRY_MINUTE = 0;
+const LIVE_SNAPSHOT_STALE_AFTER_MS = 1000 * 90;
+const LIVE_EVENT_ID_OVERRIDE =
+  (import.meta.env.VITE_NFL_EVENT_ID as string | undefined)?.trim() || undefined;
 
 const createEmptyGrid = (): GridCell[][] =>
   Array(10)
@@ -311,6 +325,11 @@ const App: React.FC = () => {
   const [squareOdds, setSquareOdds] = useState<SquareOddsComputationResult | null>(
     null,
   );
+  const [realtimeSquareOdds, setRealtimeSquareOdds] =
+    useState<RealtimeSquareOddsComputationResult | null>(null);
+  const [liveSnapshot, setLiveSnapshot] = useState<LiveGameSnapshot | null>(null);
+  const [isLiveFeedLoading, setIsLiveFeedLoading] = useState(false);
+  const [liveFeedError, setLiveFeedError] = useState<string | null>(null);
   const [isSquareOddsLoading, setIsSquareOddsLoading] = useState(false);
   const [squareOddsError, setSquareOddsError] = useState<string | null>(null);
 
@@ -344,11 +363,12 @@ const App: React.FC = () => {
   const canFinalizeGame = isLocked;
   const shouldComputeSquareOdds = isLocked && !gameResult;
   const shouldShowSquareOdds = !gameResult;
+  const activeSquareOdds = realtimeSquareOdds ?? squareOdds;
   const boardSquareOdds = useMemo(() => {
     if (gameResult) return null;
     if (!isLocked) return PRE_LOCK_UNIFORM_ODDS;
-    return squareOdds?.boardPercentages ?? null;
-  }, [gameResult, isLocked, squareOdds]);
+    return activeSquareOdds?.boardPercentages ?? null;
+  }, [gameResult, isLocked, activeSquareOdds]);
 
   const applyPersistedState = useCallback((next: PersistedState) => {
     setPricePerSquare(next.pricePerSquare);
@@ -376,6 +396,10 @@ const App: React.FC = () => {
       setIsSquareOddsLoading(false);
       setSquareOddsError(null);
       setSquareOdds(null);
+      setRealtimeSquareOdds(null);
+      setLiveSnapshot(null);
+      setIsLiveFeedLoading(false);
+      setLiveFeedError(null);
       return () => {
         cancelled = true;
       };
@@ -383,6 +407,9 @@ const App: React.FC = () => {
 
     setIsSquareOddsLoading(true);
     setSquareOddsError(null);
+    setRealtimeSquareOdds(null);
+    setLiveSnapshot(null);
+    setLiveFeedError(null);
 
     buildSquareOdds({
       homeTeamName: homeTeam,
@@ -412,6 +439,103 @@ const App: React.FC = () => {
       cancelled = true;
     };
   }, [shouldComputeSquareOdds, homeTeam, awayTeam, rowLabels, colLabels]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let inFlight = false;
+    let failureCount = 0;
+
+    if (!shouldComputeSquareOdds || !squareOdds) {
+      setIsLiveFeedLoading(false);
+      setLiveFeedError(null);
+      setLiveSnapshot(null);
+      setRealtimeSquareOdds(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const pollLiveFeed = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      setIsLiveFeedLoading(true);
+
+      try {
+        const snapshot = await fetchLiveGameSnapshot({
+          homeTeamName: homeTeam,
+          awayTeamName: awayTeam,
+          gameDate:
+            (import.meta.env.VITE_GAME_DATE as string | undefined) ??
+            DEFAULT_GAME_DATE,
+          eventIdOverride: LIVE_EVENT_ID_OVERRIDE,
+        });
+
+        if (cancelled) return;
+
+        failureCount = 0;
+        setLiveFeedError(null);
+
+        if (!snapshot) {
+          setLiveSnapshot(null);
+          setRealtimeSquareOdds(null);
+          timer = setTimeout(pollLiveFeed, 45_000);
+          return;
+        }
+
+        setLiveSnapshot(snapshot);
+
+        if (
+          snapshot.status === "in_progress" ||
+          snapshot.status === "halftime" ||
+          snapshot.status === "final"
+        ) {
+          const nextRealtime = buildRealtimeSquareOdds({
+            baseModel: squareOdds,
+            snapshot,
+            rowLabels,
+            colLabels,
+          });
+          setRealtimeSquareOdds(nextRealtime);
+        } else {
+          setRealtimeSquareOdds(null);
+        }
+
+        timer = setTimeout(pollLiveFeed, getLivePollIntervalMs(snapshot));
+      } catch (error) {
+        if (cancelled) return;
+        failureCount += 1;
+        setLiveFeedError(
+          error instanceof Error
+            ? error.message
+            : "Could not fetch live in-game updates.",
+        );
+        const retryDelay = Math.min(60_000, 12_000 + failureCount * 8_000);
+        timer = setTimeout(pollLiveFeed, retryDelay);
+      } finally {
+        inFlight = false;
+        if (!cancelled) {
+          setIsLiveFeedLoading(false);
+        }
+      }
+    };
+
+    pollLiveFeed();
+
+    return () => {
+      cancelled = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+  }, [
+    shouldComputeSquareOdds,
+    squareOdds,
+    homeTeam,
+    awayTeam,
+    rowLabels,
+    colLabels,
+  ]);
 
   useEffect(() => {
     if (!SHOULD_USE_LOCAL_SQLITE) return;
@@ -659,14 +783,24 @@ const App: React.FC = () => {
     homeFinalScore.trim() === "" &&
     awayFinalScore.trim() === "" &&
     !finalizeError;
-  const squareOddsGeneratedText = squareOdds
-    ? formatTimestamp(new Date(squareOdds.generatedAt))
+  const squareOddsGeneratedText = activeSquareOdds
+    ? formatTimestamp(new Date(activeSquareOdds.generatedAt))
     : null;
-  const squareOddsStatusMessage = squareOdds
-    ? squareOdds.sourceMode === "full"
+  const squareOddsStatusMessage = realtimeSquareOdds
+    ? "Realtime model active: score, play events, penalties, clock, and commentary sentiment are updating each square."
+    : squareOdds
+      ? squareOdds.sourceMode === "full"
       ? "Smart model active: historical scores + market lines + team APIs."
       : "Baseline model active: live feeds unavailable, using historical/poisson fallback."
+      : null;
+  const liveSnapshotUpdatedText = liveSnapshot
+    ? formatTimestamp(new Date(liveSnapshot.fetchedAt))
     : null;
+  const liveSnapshotAgeMs = liveSnapshot
+    ? Date.now() - new Date(liveSnapshot.fetchedAt).getTime()
+    : null;
+  const isLiveSnapshotStale =
+    liveSnapshotAgeMs !== null && liveSnapshotAgeMs > LIVE_SNAPSHOT_STALE_AFTER_MS;
 
   // Actions
   const handleShuffle = useCallback(() => {
@@ -1168,21 +1302,57 @@ const App: React.FC = () => {
                       {!isSquareOddsLoading && squareOddsStatusMessage && (
                         <p className="text-xs text-slate-300">{squareOddsStatusMessage}</p>
                       )}
-                      {!isSquareOddsLoading && squareOdds && squareOddsGeneratedText && (
-                        <p className="text-[11px] text-slate-500">
-                          Generated {squareOddsGeneratedText}. Projected final points:{" "}
-                          {homeTeam} {squareOdds.expectedHomePoints.toFixed(1)} /{" "}
-                          {awayTeam} {squareOdds.expectedAwayPoints.toFixed(1)}.
+                      {!isSquareOddsLoading &&
+                        !realtimeSquareOdds &&
+                        isLiveFeedLoading && (
+                          <p className="text-[11px] text-sky-300">
+                            Connecting realtime in-game feed...
+                          </p>
+                        )}
+                      {!isSquareOddsLoading &&
+                        !realtimeSquareOdds &&
+                        liveSnapshot?.status === "pregame" && (
+                          <p className="text-[11px] text-slate-400">
+                            Live feed connected. Dynamic heatmap updates will intensify once
+                            kickoff begins.
+                          </p>
+                        )}
+                      {!isSquareOddsLoading && realtimeSquareOdds && (
+                        <p className="text-[11px] text-emerald-300">
+                          Live game state: {realtimeSquareOdds.liveStatusDetail} (
+                          {realtimeSquareOdds.liveClock}).
                         </p>
                       )}
-                      {!isSquareOddsLoading && squareOdds?.warnings?.[0] && (
+                      {!isSquareOddsLoading &&
+                        realtimeSquareOdds &&
+                        liveSnapshotUpdatedText && (
+                          <p className="text-[11px] text-slate-500">
+                            Last live update {liveSnapshotUpdatedText}
+                            {isLiveSnapshotStale ? " (stale feed, retrying)." : "."}
+                          </p>
+                        )}
+                      {!isSquareOddsLoading &&
+                        activeSquareOdds &&
+                        squareOddsGeneratedText && (
+                        <p className="text-[11px] text-slate-500">
+                          Generated {squareOddsGeneratedText}. Projected final points:{" "}
+                          {homeTeam} {activeSquareOdds.expectedHomePoints.toFixed(1)} /{" "}
+                          {awayTeam} {activeSquareOdds.expectedAwayPoints.toFixed(1)}.
+                        </p>
+                      )}
+                      {!isSquareOddsLoading && activeSquareOdds?.warnings?.[0] && (
                         <p className="text-[11px] text-amber-300">
-                          Model note: {squareOdds.warnings[0]}
+                          Model note: {activeSquareOdds.warnings[0]}
                         </p>
                       )}
                       {squareOddsError && (
                         <p className="text-[11px] text-red-300">
                           Could not refresh smart odds: {squareOddsError}
+                        </p>
+                      )}
+                      {liveFeedError && (
+                        <p className="text-[11px] text-red-300">
+                          Could not refresh realtime game feed: {liveFeedError}
                         </p>
                       )}
                     </>
@@ -1212,6 +1382,15 @@ const App: React.FC = () => {
             showSquareOdds={shouldShowSquareOdds}
             isSquareOddsLoading={shouldComputeSquareOdds && isSquareOddsLoading}
             squareOddsPercentages={boardSquareOdds}
+            liveHeatmapStatusLabel={
+              realtimeSquareOdds
+                ? `${realtimeSquareOdds.liveStatusDetail} (${realtimeSquareOdds.liveClock})`
+                : liveSnapshot?.status === "pregame"
+                  ? "Live feed connected. Waiting for kickoff to increase realtime influence."
+                  : null
+            }
+            liveHeatmapUpdatedAt={liveSnapshotUpdatedText}
+            isLiveHeatmapStale={isLiveSnapshotStale}
             winningCell={
               gameResult
                 ? {

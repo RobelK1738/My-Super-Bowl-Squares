@@ -15,6 +15,9 @@ interface GridBoardProps {
   showSquareOdds?: boolean;
   isSquareOddsLoading?: boolean;
   squareOddsPercentages?: number[][] | null;
+  liveHeatmapStatusLabel?: string | null;
+  liveHeatmapUpdatedAt?: string | null;
+  isLiveHeatmapStale?: boolean;
   winningCell?: { row: number; col: number } | null;
 }
 
@@ -76,6 +79,9 @@ export const GridBoard: React.FC<GridBoardProps> = ({
   showSquareOdds = false,
   isSquareOddsLoading = false,
   squareOddsPercentages = null,
+  liveHeatmapStatusLabel = null,
+  liveHeatmapUpdatedAt = null,
+  isLiveHeatmapStale = false,
   winningCell = null,
 }) => {
   const homeLogo = getTeamLogo(homeTeamName);
@@ -206,10 +212,23 @@ export const GridBoard: React.FC<GridBoardProps> = ({
     <div className="w-full">
       {showOdds && (
         <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <div className="text-xs text-slate-400">
-            {isUniformOdds
-              ? "All squares are currently even at 1.00% until board lock."
-              : "Heatmap overlays each square's estimated win probability."}
+          <div className="space-y-1">
+            <div className="text-xs text-slate-400">
+              {isUniformOdds
+                ? "All squares are currently even at 1.00% until board lock."
+                : "Heatmap overlays each square's estimated win probability."}
+            </div>
+            {liveHeatmapStatusLabel && (
+              <div
+                className={`text-[11px] ${
+                  isLiveHeatmapStale ? "text-amber-300" : "text-sky-300"
+                }`}
+              >
+                {liveHeatmapStatusLabel}
+                {liveHeatmapUpdatedAt ? ` • Updated ${liveHeatmapUpdatedAt}` : ""}
+                {isLiveHeatmapStale ? " • Feed delay detected." : ""}
+              </div>
+            )}
           </div>
           {!isUniformOdds && (
             <div className="flex items-center gap-2">
