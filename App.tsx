@@ -2174,7 +2174,7 @@ const App: React.FC = () => {
               <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
                 <div>
                   <h3 className="text-sm font-bold uppercase tracking-wider text-slate-200">
-                    Top 5 Leading Players
+                    Top 10 Leading Players
                   </h3>
                   <p className="mt-1 text-xs text-emerald-300">
                     {leadersStatusMessage}
