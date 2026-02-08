@@ -2,10 +2,28 @@ import fs from "node:fs";
 import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { PluginOption } from "vite";
-import Database from "better-sqlite3";
 
 type BoardRow = {
   data: string;
+};
+
+type SqliteDatabase = {
+  exec: (sql: string) => void;
+  prepare: (sql: string) => {
+    get: (id: string) => BoardRow | undefined;
+    run: (params: { id: string; data: string }) => void;
+  };
+  close: () => void;
+};
+
+type DbContext = {
+  db: SqliteDatabase;
+  selectStmt: {
+    get: (id: string) => BoardRow | undefined;
+  };
+  upsertStmt: {
+    run: (params: { id: string; data: string }) => void;
+  };
 };
 
 const API_PREFIX = "/api/board-state/";
@@ -42,28 +60,51 @@ export const localSqliteBoardPlugin = (): PluginOption => {
     name: "local-sqlite-board-plugin",
     apply: "serve",
     configureServer(server) {
-      const dataDir = path.resolve(process.cwd(), ".data");
-      fs.mkdirSync(dataDir, { recursive: true });
+      let dbContextPromise: Promise<DbContext | null> | null = null;
 
-      const dbPath = path.join(dataDir, "board-state.sqlite");
-      const db = new Database(dbPath);
+      const getDbContext = async (): Promise<DbContext | null> => {
+        if (dbContextPromise) return dbContextPromise;
 
-      db.exec(`
-        create table if not exists board_state (
-          id text primary key,
-          data text not null,
-          updated_at text not null default (datetime('now'))
-        );
-      `);
+        dbContextPromise = (async () => {
+          try {
+            const dataDir = path.resolve(process.cwd(), ".data");
+            fs.mkdirSync(dataDir, { recursive: true });
 
-      const selectStmt = db.prepare("select data from board_state where id = ?");
-      const upsertStmt = db.prepare(`
-        insert into board_state (id, data, updated_at)
-        values (@id, @data, datetime('now'))
-        on conflict(id) do update set
-          data = excluded.data,
-          updated_at = datetime('now')
-      `);
+            const { default: Database } = await import("better-sqlite3");
+            const dbPath = path.join(dataDir, "board-state.sqlite");
+            const db = new (Database as unknown as new (filename: string) => SqliteDatabase)(
+              dbPath,
+            );
+
+            db.exec(`
+              create table if not exists board_state (
+                id text primary key,
+                data text not null,
+                updated_at text not null default (datetime('now'))
+              );
+            `);
+
+            const selectStmt = db.prepare("select data from board_state where id = ?");
+            const upsertStmt = db.prepare(`
+              insert into board_state (id, data, updated_at)
+              values (@id, @data, datetime('now'))
+              on conflict(id) do update set
+                data = excluded.data,
+                updated_at = datetime('now')
+            `);
+
+            return { db, selectStmt, upsertStmt };
+          } catch (error) {
+            console.warn(
+              "Local SQLite disabled: could not load better-sqlite3.",
+              error,
+            );
+            return null;
+          }
+        })();
+
+        return dbContextPromise;
+      };
 
       server.middlewares.use(async (req, res, next) => {
         const method = req.method ?? "GET";
@@ -84,8 +125,16 @@ export const localSqliteBoardPlugin = (): PluginOption => {
         }
 
         try {
+          const dbContext = await getDbContext();
+          if (!dbContext) {
+            sendJson(res, 503, {
+              error: "Local SQLite is unavailable in this environment.",
+            });
+            return;
+          }
+
           if (method === "GET") {
-            const row = selectStmt.get(boardId) as BoardRow | undefined;
+            const row = dbContext.selectStmt.get(boardId) as BoardRow | undefined;
             sendJson(res, 200, { data: row ? JSON.parse(row.data) : null });
             return;
           }
@@ -99,7 +148,7 @@ export const localSqliteBoardPlugin = (): PluginOption => {
               return;
             }
 
-            upsertStmt.run({ id: boardId, data: JSON.stringify(parsed.data) });
+            dbContext.upsertStmt.run({ id: boardId, data: JSON.stringify(parsed.data) });
             sendJson(res, 200, { ok: true });
             return;
           }
@@ -112,7 +161,11 @@ export const localSqliteBoardPlugin = (): PluginOption => {
       });
 
       server.httpServer?.once("close", () => {
-        db.close();
+        dbContextPromise
+          ?.then((context) => context?.db.close())
+          .catch(() => {
+            // Ignore teardown failures.
+          });
       });
     },
   };

@@ -9,6 +9,7 @@ A single-page React + Vite app for running a classic 10x10 Super Bowl squares bo
 - Admin final-score workflow that computes and announces the winner.
 - Pot size is computed from filled squares and the per-square cost.
 - Realtime heatmap updates after kickoff (score, play events, penalties, clock, and commentary sentiment).
+- Dev-only admin local stream simulator to test realtime heatmap without a live game.
 
 **How The App Works**
 1. The board starts with 10x10 empty squares and row/column labels from `0-9`.
@@ -112,8 +113,12 @@ Prerequisite: Node.js
    - Optional: `VITE_GAME_DATE=2026-02-08` (defaults to this date if omitted; final-score entry opens at 10:00 PM local time)
    - Optional: `VITE_NFL_EVENT_ID=401671813` (force a specific ESPN event ID for realtime odds updates)
    - Optional: `VITE_USE_LOCAL_SQLITE=false` to disable SQLite in local dev
+   - Optional: `VITE_ENABLE_LOCAL_LIVE_SIMULATOR=false` to hide/disable the dev-only local simulator panel
 3. Run the dev server:
    `npm run dev`
+
+In dev mode, admin users get a **Local Live Simulator** panel in the controls section.
+Use it to override the live stream locally and inject scoring/penalty/turnover events.
 
 You can also use the helper script:
 ```bash
@@ -125,6 +130,18 @@ You can also use the helper script:
   `npm run build`
 - Preview the production build:
   `npm run preview`
+
+**Deploy On Vercel**
+1. Import the repo in Vercel (framework preset: Vite).
+2. Build command: `npm run build`
+3. Output directory: `dist`
+4. Set environment variables in Vercel:
+   - `VITE_ADMIN_PASSCODE` (required for admin mode)
+   - `VITE_SUPABASE_URL` + `VITE_SUPABASE_ANON_KEY` (optional, for shared persistence)
+   - `VITE_BOARD_ID` (optional)
+   - `VITE_GAME_DATE` (optional)
+   - `VITE_NFL_EVENT_ID` (optional)
+5. Do not enable local SQLite on Vercel. It is dev-only.
 
 **Admin Passcode**
 Set `VITE_ADMIN_PASSCODE` in `.env.local`. Vite only exposes variables prefixed with `VITE_`.

@@ -23,12 +23,14 @@ import { GridBoard } from "./components/GridBoard";
 import { EditModal } from "./components/EditModal";
 import { AuthModal } from "./components/AuthModal";
 import { WinnerModal } from "./components/WinnerModal";
-import { INITIAL_COLS, INITIAL_ROWS } from "./constants";
+import { INITIAL_COLS, INITIAL_ROWS, NFL_TEAMS } from "./constants";
 import { buildSquareOdds } from "./services/squareOddsService";
 import {
   GameResult,
+  LiveGameStatus,
   GridCell,
   LiveGameSnapshot,
+  LivePlayEvent,
   RealtimeSquareOddsComputationResult,
   SquareOddsComputationResult,
 } from "./types";
@@ -48,6 +50,14 @@ const DEFAULT_GAME_DATE = "2026-02-08";
 const SCORE_ENTRY_HOUR = 22;
 const SCORE_ENTRY_MINUTE = 0;
 const LIVE_SNAPSHOT_STALE_AFTER_MS = 1000 * 90;
+const ENABLE_LOCAL_LIVE_SIMULATOR =
+  import.meta.env.DEV &&
+  (
+    (import.meta.env.VITE_ENABLE_LOCAL_LIVE_SIMULATOR as string | undefined) ??
+    "true"
+  )
+    .trim()
+    .toLowerCase() !== "false";
 const LIVE_EVENT_ID_OVERRIDE =
   (import.meta.env.VITE_NFL_EVENT_ID as string | undefined)?.trim() || undefined;
 
@@ -77,6 +87,49 @@ type PersistedState = {
   colLabels: number[];
   grid: GridCell[][];
   gameResult: GameResult | null;
+};
+
+type SimulatorEventTeam = "home" | "away" | "neutral";
+
+const clamp = (value: number, min: number, max: number): number =>
+  Math.min(max, Math.max(min, value));
+
+const normalizeText = (value: string): string =>
+  value
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const resolveTeamCodeByName = (teamNameOrCode: string): string => {
+  const normalized = normalizeText(teamNameOrCode);
+  const found =
+    NFL_TEAMS.find((team) => normalizeText(team.id) === normalized) ??
+    NFL_TEAMS.find((team) => normalizeText(team.name) === normalized) ??
+    NFL_TEAMS.find((team) => normalized.endsWith(normalizeText(team.name))) ??
+    null;
+
+  if (found) return found.id.toUpperCase();
+
+  const fallback = teamNameOrCode.trim().slice(0, 3).toUpperCase();
+  return fallback || "UNK";
+};
+
+const parseClockToSeconds = (value: string): number | null => {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
+  if (!match) return null;
+  const minutes = Number.parseInt(match[1], 10);
+  const seconds = Number.parseInt(match[2], 10);
+  if (!Number.isFinite(minutes) || !Number.isFinite(seconds)) return null;
+  if (minutes < 0 || seconds < 0 || seconds > 59) return null;
+  return clamp(minutes * 60 + seconds, 0, 15 * 60);
+};
+
+const formatSecondsAsClock = (seconds: number): string => {
+  const safe = clamp(Math.round(seconds), 0, 15 * 60);
+  const minutesPart = Math.floor(safe / 60);
+  const secondsPart = safe % 60;
+  return `${minutesPart}:${secondsPart.toString().padStart(2, "0")}`;
 };
 
 const coerceLabels = (value: unknown): number[] | null => {
@@ -330,6 +383,19 @@ const App: React.FC = () => {
   const [liveSnapshot, setLiveSnapshot] = useState<LiveGameSnapshot | null>(null);
   const [isLiveFeedLoading, setIsLiveFeedLoading] = useState(false);
   const [liveFeedError, setLiveFeedError] = useState<string | null>(null);
+  const [isLocalLiveSimulatorEnabled, setIsLocalLiveSimulatorEnabled] =
+    useState(false);
+  const [isLocalLiveClockRunning, setIsLocalLiveClockRunning] = useState(false);
+  const [localLiveStatus, setLocalLiveStatus] = useState<LiveGameStatus>("pregame");
+  const [localLivePeriod, setLocalLivePeriod] = useState(1);
+  const [localLiveClock, setLocalLiveClock] = useState("15:00");
+  const [localHomeLiveScore, setLocalHomeLiveScore] = useState("0");
+  const [localAwayLiveScore, setLocalAwayLiveScore] = useState("0");
+  const [localLivePlays, setLocalLivePlays] = useState<LivePlayEvent[]>([]);
+  const [localCustomEventText, setLocalCustomEventText] = useState("");
+  const [localCustomEventTeam, setLocalCustomEventTeam] =
+    useState<SimulatorEventTeam>("neutral");
+  const localLiveEventCounterRef = useRef(1);
   const [isSquareOddsLoading, setIsSquareOddsLoading] = useState(false);
   const [squareOddsError, setSquareOddsError] = useState<string | null>(null);
 
@@ -363,6 +429,10 @@ const App: React.FC = () => {
   const canFinalizeGame = isLocked;
   const shouldComputeSquareOdds = isLocked && !gameResult;
   const shouldShowSquareOdds = !gameResult;
+  const homeTeamCode = useMemo(() => resolveTeamCodeByName(homeTeam), [homeTeam]);
+  const awayTeamCode = useMemo(() => resolveTeamCodeByName(awayTeam), [awayTeam]);
+  const isUsingLocalLiveSimulator =
+    ENABLE_LOCAL_LIVE_SIMULATOR && isAdmin && isLocalLiveSimulatorEnabled;
   const activeSquareOdds = realtimeSquareOdds ?? squareOdds;
   const boardSquareOdds = useMemo(() => {
     if (gameResult) return null;
@@ -379,6 +449,174 @@ const App: React.FC = () => {
     setGameResult(next.gameResult);
   }, []);
 
+  const appendLocalLivePlay = useCallback(
+    (input: {
+      team: SimulatorEventTeam;
+      text: string;
+      points?: number;
+      isScoringPlay?: boolean;
+      isPenalty?: boolean;
+      isTurnover?: boolean;
+      isExplosivePlay?: boolean;
+      sentimentScore?: number;
+    }) => {
+      const normalizedPoints = Math.max(0, Math.round(input.points ?? 0));
+
+      if (normalizedPoints > 0 && input.team === "home") {
+        setLocalHomeLiveScore((prev) => {
+          const parsed = Number.parseInt(prev, 10);
+          return String((Number.isFinite(parsed) ? parsed : 0) + normalizedPoints);
+        });
+      }
+
+      if (normalizedPoints > 0 && input.team === "away") {
+        setLocalAwayLiveScore((prev) => {
+          const parsed = Number.parseInt(prev, 10);
+          return String((Number.isFinite(parsed) ? parsed : 0) + normalizedPoints);
+        });
+      }
+
+      const teamCode =
+        input.team === "home"
+          ? homeTeamCode
+          : input.team === "away"
+            ? awayTeamCode
+            : null;
+
+      const sentimentScore =
+        typeof input.sentimentScore === "number" && Number.isFinite(input.sentimentScore)
+          ? clamp(input.sentimentScore, -1, 1)
+          : 0;
+
+      const nextEventId = `sim-${localLiveEventCounterRef.current}`;
+      localLiveEventCounterRef.current += 1;
+
+      const nextPlay: LivePlayEvent = {
+        id: nextEventId,
+        text: input.text.trim() || "Simulated play",
+        teamCode,
+        period: localLivePeriod,
+        clock: localLiveClock,
+        isScoringPlay: Boolean(input.isScoringPlay),
+        isPenalty: Boolean(input.isPenalty),
+        isTurnover: Boolean(input.isTurnover),
+        isExplosivePlay: Boolean(input.isExplosivePlay),
+        sentimentScore,
+      };
+
+      setLocalLivePlays((prev) => [...prev.slice(-159), nextPlay]);
+    },
+    [awayTeamCode, homeTeamCode, localLiveClock, localLivePeriod],
+  );
+
+  const resetLocalLiveSimulator = useCallback(() => {
+    setLocalLiveStatus("pregame");
+    setLocalLivePeriod(1);
+    setLocalLiveClock("15:00");
+    setLocalHomeLiveScore("0");
+    setLocalAwayLiveScore("0");
+    setLocalLivePlays([]);
+    setLocalCustomEventText("");
+    setLocalCustomEventTeam("neutral");
+    setIsLocalLiveClockRunning(false);
+    localLiveEventCounterRef.current = 1;
+  }, []);
+
+  const buildLocalLiveSnapshot = useCallback((): LiveGameSnapshot => {
+    const period = clamp(Math.round(localLivePeriod), 1, 10);
+    const homeScore = Math.max(0, Number.parseInt(localHomeLiveScore, 10) || 0);
+    const awayScore = Math.max(0, Number.parseInt(localAwayLiveScore, 10) || 0);
+
+    const secondsRemainingInPeriod = parseClockToSeconds(localLiveClock);
+    const secondsRemainingGame =
+      localLiveStatus === "final" || localLiveStatus === "postponed"
+        ? 0
+        : localLiveStatus === "pregame"
+          ? 4 * 15 * 60
+          : localLiveStatus === "halftime"
+            ? 2 * 15 * 60
+            : secondsRemainingInPeriod === null
+              ? null
+              : period <= 4
+                ? (4 - period) * 15 * 60 + secondsRemainingInPeriod
+                : secondsRemainingInPeriod;
+
+    const recentPlays = localLivePlays.slice(-80);
+    let homeWeighted = 0;
+    let awayWeighted = 0;
+    let neutralWeighted = 0;
+    let homeWeight = 0;
+    let awayWeight = 0;
+    let neutralWeight = 0;
+
+    for (let index = 0; index < recentPlays.length; index += 1) {
+      const play = recentPlays[index];
+      const recencyWeight = Math.exp(-(recentPlays.length - 1 - index) / 12);
+      if (play.teamCode === homeTeamCode) {
+        homeWeighted += play.sentimentScore * recencyWeight;
+        homeWeight += recencyWeight;
+        continue;
+      }
+      if (play.teamCode === awayTeamCode) {
+        awayWeighted += play.sentimentScore * recencyWeight;
+        awayWeight += recencyWeight;
+        continue;
+      }
+      neutralWeighted += play.sentimentScore * recencyWeight;
+      neutralWeight += recencyWeight;
+    }
+
+    const statusDetail =
+      localLiveStatus === "in_progress"
+        ? `Q${period} ${localLiveClock}`
+        : localLiveStatus === "pregame"
+          ? "Simulator Pregame"
+          : localLiveStatus === "halftime"
+            ? "Halftime (Simulator)"
+            : localLiveStatus === "final"
+              ? "Final (Simulator)"
+              : "Local Simulator";
+
+    return {
+      eventId: `LOCAL-SIM-${homeTeamCode}-${awayTeamCode}`,
+      fetchedAt: new Date().toISOString(),
+      status: localLiveStatus,
+      statusDetail,
+      homeTeamCode,
+      awayTeamCode,
+      homeTeamName: homeTeam,
+      awayTeamName: awayTeam,
+      homeScore,
+      awayScore,
+      clock: {
+        period,
+        displayClock: localLiveClock,
+        secondsRemainingInPeriod,
+        secondsRemainingGame,
+      },
+      plays: recentPlays,
+      sentiment: {
+        home: homeWeight > 0 ? clamp(homeWeighted / homeWeight, -1, 1) : 0,
+        away: awayWeight > 0 ? clamp(awayWeighted / awayWeight, -1, 1) : 0,
+        neutral:
+          neutralWeight > 0
+            ? clamp((neutralWeighted / neutralWeight + 1) / 2, 0, 1)
+            : 1,
+      },
+    };
+  }, [
+    awayTeam,
+    awayTeamCode,
+    homeTeam,
+    homeTeamCode,
+    localAwayLiveScore,
+    localHomeLiveScore,
+    localLiveClock,
+    localLivePeriod,
+    localLivePlays,
+    localLiveStatus,
+  ]);
+
   useEffect(() => {
     if (!gameResult) return;
     if (!isLandingPath) return;
@@ -388,6 +626,76 @@ const App: React.FC = () => {
     setAwayFinalScore(String(gameResult.awayScore));
     setIsWinnerModalOpen(true);
   }, [gameResult, isLandingPath]);
+
+  useEffect(() => {
+    if (isAdmin) return;
+    if (!isLocalLiveSimulatorEnabled) return;
+    setIsLocalLiveSimulatorEnabled(false);
+    setIsLocalLiveClockRunning(false);
+  }, [isAdmin, isLocalLiveSimulatorEnabled]);
+
+  useEffect(() => {
+    if (localLiveStatus === "in_progress") return;
+    setIsLocalLiveClockRunning(false);
+  }, [localLiveStatus]);
+
+  useEffect(() => {
+    if (!isUsingLocalLiveSimulator) return;
+    if (!isLocalLiveClockRunning) return;
+    if (localLiveStatus !== "in_progress") return;
+
+    const timer = window.setInterval(() => {
+      setLocalLiveClock((prev) => {
+        const seconds = parseClockToSeconds(prev);
+        if (seconds === null) return prev;
+        if (seconds <= 0) {
+          setIsLocalLiveClockRunning(false);
+          return "0:00";
+        }
+        return formatSecondsAsClock(seconds - 1);
+      });
+    }, 1000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [
+    isLocalLiveClockRunning,
+    isUsingLocalLiveSimulator,
+    localLiveStatus,
+  ]);
+
+  useEffect(() => {
+    if (!shouldComputeSquareOdds || !squareOdds || !isUsingLocalLiveSimulator) return;
+
+    const snapshot = buildLocalLiveSnapshot();
+    setLiveSnapshot(snapshot);
+    setIsLiveFeedLoading(false);
+    setLiveFeedError(null);
+
+    if (
+      snapshot.status === "in_progress" ||
+      snapshot.status === "halftime" ||
+      snapshot.status === "final"
+    ) {
+      const realtime = buildRealtimeSquareOdds({
+        baseModel: squareOdds,
+        snapshot,
+        rowLabels,
+        colLabels,
+      });
+      setRealtimeSquareOdds(realtime);
+    } else {
+      setRealtimeSquareOdds(null);
+    }
+  }, [
+    buildLocalLiveSnapshot,
+    colLabels,
+    isUsingLocalLiveSimulator,
+    rowLabels,
+    shouldComputeSquareOdds,
+    squareOdds,
+  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -451,6 +759,14 @@ const App: React.FC = () => {
       setLiveFeedError(null);
       setLiveSnapshot(null);
       setRealtimeSquareOdds(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (isUsingLocalLiveSimulator) {
+      setIsLiveFeedLoading(false);
+      setLiveFeedError(null);
       return () => {
         cancelled = true;
       };
@@ -529,6 +845,7 @@ const App: React.FC = () => {
       }
     };
   }, [
+    isUsingLocalLiveSimulator,
     shouldComputeSquareOdds,
     squareOdds,
     homeTeam,
@@ -800,7 +1117,9 @@ const App: React.FC = () => {
     ? Date.now() - new Date(liveSnapshot.fetchedAt).getTime()
     : null;
   const isLiveSnapshotStale =
-    liveSnapshotAgeMs !== null && liveSnapshotAgeMs > LIVE_SNAPSHOT_STALE_AFTER_MS;
+    !isUsingLocalLiveSimulator &&
+    liveSnapshotAgeMs !== null &&
+    liveSnapshotAgeMs > LIVE_SNAPSHOT_STALE_AFTER_MS;
 
   // Actions
   const handleShuffle = useCallback(() => {
@@ -947,6 +1266,81 @@ const App: React.FC = () => {
     setFinalizeError(null);
     setIsWinnerModalOpen(false);
     announcedResultRef.current = null;
+  };
+
+  const handleLocalSimulatorQuickEvent = useCallback(
+    (
+      team: Exclude<SimulatorEventTeam, "neutral">,
+      type: "touchdown" | "field_goal" | "penalty" | "turnover" | "big_play",
+    ) => {
+      if (!isUsingLocalLiveSimulator) return;
+
+      if (type === "touchdown") {
+        appendLocalLivePlay({
+          team,
+          text: team === "home" ? `${homeTeam} touchdown` : `${awayTeam} touchdown`,
+          points: 7,
+          isScoringPlay: true,
+          sentimentScore: 0.95,
+        });
+        return;
+      }
+
+      if (type === "field_goal") {
+        appendLocalLivePlay({
+          team,
+          text: team === "home" ? `${homeTeam} field goal is good` : `${awayTeam} field goal is good`,
+          points: 3,
+          isScoringPlay: true,
+          sentimentScore: 0.55,
+        });
+        return;
+      }
+
+      if (type === "penalty") {
+        appendLocalLivePlay({
+          team,
+          text: team === "home" ? `Penalty on ${homeTeam}` : `Penalty on ${awayTeam}`,
+          isPenalty: true,
+          sentimentScore: -0.65,
+        });
+        return;
+      }
+
+      if (type === "turnover") {
+        appendLocalLivePlay({
+          team,
+          text:
+            team === "home"
+              ? `${homeTeam} turnover on the play`
+              : `${awayTeam} turnover on the play`,
+          isTurnover: true,
+          sentimentScore: -0.95,
+        });
+        return;
+      }
+
+      appendLocalLivePlay({
+        team,
+        text: team === "home" ? `${homeTeam} explosive gain` : `${awayTeam} explosive gain`,
+        isExplosivePlay: true,
+        sentimentScore: 0.45,
+      });
+    },
+    [appendLocalLivePlay, awayTeam, homeTeam, isUsingLocalLiveSimulator],
+  );
+
+  const handleAddCustomLocalEvent = () => {
+    if (!isUsingLocalLiveSimulator) return;
+    const text = localCustomEventText.trim();
+    if (!text) return;
+
+    appendLocalLivePlay({
+      team: localCustomEventTeam,
+      text,
+      sentimentScore: 0.1,
+    });
+    setLocalCustomEventText("");
   };
 
   return (
@@ -1101,7 +1495,7 @@ const App: React.FC = () => {
         {/* Controls Section (Admin Only) */}
         {isAdmin && (
           <section className="bg-slate-900 rounded-xl border border-slate-800 p-6 shadow-xl">
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-8">
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-8">
               {/* Money Settings */}
               <div className="space-y-4">
                 <h2 className="text-sm font-bold text-slate-500 uppercase tracking-wider flex items-center gap-2">
@@ -1237,6 +1631,315 @@ const App: React.FC = () => {
                   </div>
                 </form>
               </div>
+
+              {ENABLE_LOCAL_LIVE_SIMULATOR && (
+                <div className="space-y-4 bg-slate-950/60 border border-slate-700/80 rounded-lg p-4">
+                  <h2 className="text-sm font-bold text-slate-400 uppercase tracking-wider">
+                    Local Live Simulator
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    Dev-only backdoor for testing realtime heatmap updates. This override
+                    runs locally in your browser and bypasses live ESPN polling while active.
+                  </p>
+
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={isUsingLocalLiveSimulator ? "danger" : "secondary"}
+                      onClick={() => {
+                        setIsLocalLiveSimulatorEnabled((prev) => !prev);
+                        setIsLocalLiveClockRunning(false);
+                      }}
+                    >
+                      {isUsingLocalLiveSimulator
+                        ? "Disable Local Stream"
+                        : "Enable Local Stream"}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      onClick={resetLocalLiveSimulator}
+                      disabled={!isUsingLocalLiveSimulator}
+                    >
+                      Reset Simulator
+                    </Button>
+                  </div>
+
+                  {isUsingLocalLiveSimulator && (
+                    <>
+                      {!isLocked && (
+                        <p className="text-[11px] text-amber-300">
+                          Lock the board to see simulator-driven realtime odds on the grid.
+                        </p>
+                      )}
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <label className="block text-xs text-slate-400">
+                          Status
+                          <select
+                            value={localLiveStatus}
+                            onChange={(e) =>
+                              setLocalLiveStatus(e.target.value as LiveGameStatus)
+                            }
+                            className="mt-1 w-full bg-slate-900 border border-slate-700 rounded px-2 py-2 text-sm text-white focus:border-emerald-500 focus:outline-none"
+                          >
+                            <option value="pregame">Pregame</option>
+                            <option value="in_progress">In Progress</option>
+                            <option value="halftime">Halftime</option>
+                            <option value="final">Final</option>
+                            <option value="postponed">Postponed</option>
+                          </select>
+                        </label>
+
+                        <label className="block text-xs text-slate-400">
+                          Period
+                          <input
+                            type="number"
+                            min="1"
+                            max="10"
+                            value={localLivePeriod}
+                            onChange={(e) => {
+                              const next = Number.parseInt(e.target.value, 10);
+                              if (Number.isFinite(next)) {
+                                setLocalLivePeriod(clamp(next, 1, 10));
+                              }
+                            }}
+                            className="mt-1 w-full bg-slate-900 border border-slate-700 rounded px-2 py-2 text-sm text-white focus:border-emerald-500 focus:outline-none"
+                          />
+                        </label>
+
+                        <label className="block text-xs text-slate-400">
+                          Clock (mm:ss)
+                          <input
+                            value={localLiveClock}
+                            onChange={(e) => setLocalLiveClock(e.target.value)}
+                            onBlur={() => {
+                              const parsedSeconds = parseClockToSeconds(localLiveClock);
+                              if (parsedSeconds === null) {
+                                setLocalLiveClock("15:00");
+                                return;
+                              }
+                              setLocalLiveClock(formatSecondsAsClock(parsedSeconds));
+                            }}
+                            className="mt-1 w-full bg-slate-900 border border-slate-700 rounded px-2 py-2 text-sm text-white focus:border-emerald-500 focus:outline-none"
+                            placeholder="12:34"
+                          />
+                        </label>
+
+                        <div className="flex items-end">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant={isLocalLiveClockRunning ? "danger" : "secondary"}
+                            className="w-full"
+                            disabled={localLiveStatus !== "in_progress"}
+                            onClick={() =>
+                              setIsLocalLiveClockRunning((prev) => !prev)
+                            }
+                          >
+                            {isLocalLiveClockRunning ? "Pause Clock" : "Start Clock"}
+                          </Button>
+                        </div>
+
+                        <label className="block text-xs text-slate-400">
+                          {homeTeam} score
+                          <input
+                            type="number"
+                            min="0"
+                            value={localHomeLiveScore}
+                            onChange={(e) =>
+                              setLocalHomeLiveScore(
+                                String(
+                                  Math.max(
+                                    0,
+                                    Number.parseInt(e.target.value || "0", 10) || 0,
+                                  ),
+                                ),
+                              )
+                            }
+                            className="mt-1 w-full bg-slate-900 border border-slate-700 rounded px-2 py-2 text-sm text-white focus:border-emerald-500 focus:outline-none"
+                          />
+                        </label>
+
+                        <label className="block text-xs text-slate-400">
+                          {awayTeam} score
+                          <input
+                            type="number"
+                            min="0"
+                            value={localAwayLiveScore}
+                            onChange={(e) =>
+                              setLocalAwayLiveScore(
+                                String(
+                                  Math.max(
+                                    0,
+                                    Number.parseInt(e.target.value || "0", 10) || 0,
+                                  ),
+                                ),
+                              )
+                            }
+                            className="mt-1 w-full bg-slate-900 border border-slate-700 rounded px-2 py-2 text-sm text-white focus:border-emerald-500 focus:outline-none"
+                          />
+                        </label>
+                      </div>
+
+                      <div className="space-y-2">
+                        <p className="text-[11px] text-slate-500 uppercase tracking-wider">
+                          Quick Event Injectors
+                        </p>
+                        <div className="grid grid-cols-2 gap-2">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="secondary"
+                            onClick={() =>
+                              handleLocalSimulatorQuickEvent("home", "touchdown")
+                            }
+                          >
+                            {homeTeam} +7
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="secondary"
+                            onClick={() =>
+                              handleLocalSimulatorQuickEvent("away", "touchdown")
+                            }
+                          >
+                            {awayTeam} +7
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="secondary"
+                            onClick={() =>
+                              handleLocalSimulatorQuickEvent("home", "field_goal")
+                            }
+                          >
+                            {homeTeam} +3
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="secondary"
+                            onClick={() =>
+                              handleLocalSimulatorQuickEvent("away", "field_goal")
+                            }
+                          >
+                            {awayTeam} +3
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            onClick={() =>
+                              handleLocalSimulatorQuickEvent("home", "penalty")
+                            }
+                          >
+                            Penalty {homeTeam}
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            onClick={() =>
+                              handleLocalSimulatorQuickEvent("away", "penalty")
+                            }
+                          >
+                            Penalty {awayTeam}
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            onClick={() =>
+                              handleLocalSimulatorQuickEvent("home", "turnover")
+                            }
+                          >
+                            Turnover {homeTeam}
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            onClick={() =>
+                              handleLocalSimulatorQuickEvent("away", "turnover")
+                            }
+                          >
+                            Turnover {awayTeam}
+                          </Button>
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <p className="text-[11px] text-slate-500 uppercase tracking-wider">
+                          Custom Event
+                        </p>
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                          <select
+                            value={localCustomEventTeam}
+                            onChange={(e) =>
+                              setLocalCustomEventTeam(
+                                e.target.value as SimulatorEventTeam,
+                              )
+                            }
+                            className="bg-slate-900 border border-slate-700 rounded px-2 py-2 text-sm text-white focus:border-emerald-500 focus:outline-none"
+                          >
+                            <option value="neutral">Neutral</option>
+                            <option value="home">{homeTeam}</option>
+                            <option value="away">{awayTeam}</option>
+                          </select>
+                          <input
+                            value={localCustomEventText}
+                            onChange={(e) => setLocalCustomEventText(e.target.value)}
+                            placeholder="Type any simulated play text"
+                            className="sm:col-span-2 bg-slate-900 border border-slate-700 rounded px-2 py-2 text-sm text-white focus:border-emerald-500 focus:outline-none"
+                          />
+                        </div>
+                        <div className="flex gap-2">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="secondary"
+                            onClick={handleAddCustomLocalEvent}
+                            disabled={localCustomEventText.trim() === ""}
+                          >
+                            Add Custom Event
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => setLocalLivePlays([])}
+                            disabled={localLivePlays.length === 0}
+                          >
+                            Clear Events
+                          </Button>
+                        </div>
+                      </div>
+
+                      {localLivePlays[0] && (
+                        <div className="rounded border border-slate-700/80 bg-slate-900/70 p-2">
+                          <p className="text-[11px] uppercase tracking-wider text-slate-500 mb-1">
+                            Recent Sim Events
+                          </p>
+                          <div className="space-y-1 max-h-28 overflow-y-auto pr-1">
+                            {localLivePlays
+                              .slice(-5)
+                              .reverse()
+                              .map((play) => (
+                                <p key={play.id} className="text-[11px] text-slate-300">
+                                  [{play.clock ?? "--:--"}] {play.text}
+                                </p>
+                              ))}
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
             </div>
           </section>
         )}
@@ -1313,8 +2016,9 @@ const App: React.FC = () => {
                         !realtimeSquareOdds &&
                         liveSnapshot?.status === "pregame" && (
                           <p className="text-[11px] text-slate-400">
-                            Live feed connected. Dynamic heatmap updates will intensify once
-                            kickoff begins.
+                            {isUsingLocalLiveSimulator
+                              ? "Local simulator is in pregame mode. Switch status to In Progress or inject events to drive dynamic heatmap shifts."
+                              : "Live feed connected. Dynamic heatmap updates will intensify once kickoff begins."}
                           </p>
                         )}
                       {!isSquareOddsLoading && realtimeSquareOdds && (
@@ -1386,7 +2090,9 @@ const App: React.FC = () => {
               realtimeSquareOdds
                 ? `${realtimeSquareOdds.liveStatusDetail} (${realtimeSquareOdds.liveClock})`
                 : liveSnapshot?.status === "pregame"
-                  ? "Live feed connected. Waiting for kickoff to increase realtime influence."
+                  ? isUsingLocalLiveSimulator
+                    ? "Local simulator ready. Set In Progress and inject events to test realtime heatmap."
+                    : "Live feed connected. Waiting for kickoff to increase realtime influence."
                   : null
             }
             liveHeatmapUpdatedAt={liveSnapshotUpdatedText}
