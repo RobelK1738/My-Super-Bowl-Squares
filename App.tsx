@@ -28,6 +28,9 @@ import { isSupabaseConfigured, supabase } from "./supabaseClient";
 
 const STORAGE_KEY = "sb-lx-squares-v1";
 const BOARD_ID = import.meta.env.VITE_BOARD_ID || "default";
+const SHOULD_USE_LOCAL_SQLITE =
+  import.meta.env.DEV && import.meta.env.VITE_USE_LOCAL_SQLITE !== "false";
+const SQLITE_API_BASE = "/api/board-state";
 
 type PersistedState = {
   version: 1;
@@ -121,7 +124,9 @@ const loadPersistedState = (): PersistedState | null => {
 
 const App: React.FC = () => {
   const [persistedState] = useState(() => loadPersistedState());
-  const [isRemoteReady, setIsRemoteReady] = useState(!isSupabaseConfigured);
+  const [isRemoteReady, setIsRemoteReady] = useState(
+    SHOULD_USE_LOCAL_SQLITE ? false : !isSupabaseConfigured,
+  );
   const skipNextSaveRef = useRef(false);
   const lastSavedRef = useRef<string | null>(null);
   const seedRef = useRef<PersistedState>(
@@ -178,7 +183,55 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    if (!isSupabaseConfigured || !supabase) return;
+    if (!SHOULD_USE_LOCAL_SQLITE) return;
+    let cancelled = false;
+
+    const handleLocalSqlitePayload = (payload: unknown) => {
+      const normalized = normalizePersistedState(payload);
+      if (!normalized) return;
+      const nextString = JSON.stringify(normalized);
+      if (nextString === lastSavedRef.current) return;
+      skipNextSaveRef.current = true;
+      applyPersistedState(normalized);
+    };
+
+    const loadLocalSqliteState = async () => {
+      try {
+        const response = await fetch(
+          `${SQLITE_API_BASE}/${encodeURIComponent(BOARD_ID)}`,
+        );
+        if (!response.ok) {
+          throw new Error(`Local SQLite fetch failed with ${response.status}`);
+        }
+        const data = (await response.json()) as { data?: unknown };
+
+        if (cancelled) return;
+
+        if (data?.data) {
+          handleLocalSqlitePayload(data.data);
+        } else {
+          await fetch(`${SQLITE_API_BASE}/${encodeURIComponent(BOARD_ID)}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ data: seedRef.current }),
+          });
+        }
+      } catch (error) {
+        console.warn("Failed to load board from local SQLite.", error);
+      } finally {
+        if (!cancelled) setIsRemoteReady(true);
+      }
+    };
+
+    loadLocalSqliteState();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [applyPersistedState]);
+
+  useEffect(() => {
+    if (SHOULD_USE_LOCAL_SQLITE || !isSupabaseConfigured || !supabase) return;
     let cancelled = false;
 
     const handleRemotePayload = (payload: unknown) => {
@@ -250,7 +303,7 @@ const App: React.FC = () => {
   }, [applyPersistedState]);
 
   useEffect(() => {
-    if (isSupabaseConfigured) return;
+    if (SHOULD_USE_LOCAL_SQLITE || isSupabaseConfigured) return;
     const payload: PersistedState = {
       version: 1,
       pricePerSquare,
@@ -267,7 +320,45 @@ const App: React.FC = () => {
   }, [pricePerSquare, isLocked, rowLabels, colLabels, grid]);
 
   useEffect(() => {
-    if (!isSupabaseConfigured || !supabase || !isRemoteReady) return;
+    if (!SHOULD_USE_LOCAL_SQLITE || !isRemoteReady) return;
+    if (skipNextSaveRef.current) {
+      skipNextSaveRef.current = false;
+      return;
+    }
+    const payload: PersistedState = {
+      version: 1,
+      pricePerSquare,
+      isLocked,
+      rowLabels,
+      colLabels,
+      grid,
+    };
+    const payloadString = JSON.stringify(payload);
+    if (payloadString === lastSavedRef.current) return;
+    lastSavedRef.current = payloadString;
+
+    fetch(`${SQLITE_API_BASE}/${encodeURIComponent(BOARD_ID)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ data: payload }),
+    }).then((response) => {
+      if (!response.ok) {
+        throw new Error(`Local SQLite save failed with ${response.status}`);
+      }
+    }).catch((error) => {
+      console.warn("Failed to save board to local SQLite.", error);
+    });
+  }, [pricePerSquare, isLocked, rowLabels, colLabels, grid, isRemoteReady]);
+
+  useEffect(() => {
+    if (
+      SHOULD_USE_LOCAL_SQLITE ||
+      !isSupabaseConfigured ||
+      !supabase ||
+      !isRemoteReady
+    ) {
+      return;
+    }
     if (skipNextSaveRef.current) {
       skipNextSaveRef.current = false;
       return;

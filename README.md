@@ -38,9 +38,10 @@ A single-page React + Vite app for running a classic 10x10 Super Bowl squares bo
   - Shuffles the `rowLabels` and `colLabels` arrays in place.
 
 **State & Persistence**
-- By default, app state is persisted in `localStorage` in the browser.
-- This keeps data across reloads on the same device/browser only.
-- For shared persistence across devices/users, configure Supabase (see below).
+- When running `npm run dev` locally, app state is persisted to SQLite (`.data/board-state.sqlite`) via a Vite dev API.
+- This keeps one shared board state for your local dev server across browser reloads/tabs.
+- To disable local SQLite in dev and use the old fallback, set `VITE_USE_LOCAL_SQLITE=false` in `.env.local`.
+- For shared persistence across devices/users outside local dev, configure Supabase (see below).
 - Admin login is client-side only and uses a hardcoded passcode.
 
 **Shared Persistence (Supabase)**
@@ -97,6 +98,7 @@ Prerequisite: Node.js
 2. Set environment variables in `.env.local` (if required by your environment):
    - `GEMINI_API_KEY=YOUR_KEY`
    - `VITE_ADMIN_PASSCODE=YOUR_PASSCODE`
+   - Optional: `VITE_USE_LOCAL_SQLITE=false` to disable SQLite in local dev
 3. Run the dev server:
    `npm run dev`
 
