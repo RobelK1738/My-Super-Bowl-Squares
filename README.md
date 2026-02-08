@@ -6,6 +6,7 @@ A single-page React + Vite app for running a classic 10x10 Super Bowl squares bo
 - 10x10 grid (100 squares) with row and column labels.
 - Admin workflow to assign squares and manage the board.
 - Numbers are hidden until the board is locked.
+- Admin final-score workflow that computes and announces the winner.
 - Pot size is computed from filled squares and the per-square cost.
 
 **How The App Works**
@@ -19,10 +20,12 @@ A single-page React + Vite app for running a classic 10x10 Super Bowl squares bo
 - Viewer:
   - Can view the board, but cannot edit.
   - Sees row/column numbers only after the board is locked.
+  - Sees winner announcement modal after the final score is submitted.
 - Admin:
   - Can assign and clear squares.
   - Can shuffle row/column numbers.
   - Can lock/unlock the board.
+  - Can submit final score to determine winner from score last digits.
   - Can reset the entire board.
 
 **Key Behaviors**
@@ -36,6 +39,13 @@ A single-page React + Vite app for running a classic 10x10 Super Bowl squares bo
   - When unlocked, non-admin users see placeholders instead of numbers.
 - **Shuffling**:
   - Shuffles the `rowLabels` and `colLabels` arrays in place.
+  - Disabled while board is locked to keep revealed numbers fixed.
+- **Winner Calculation**:
+  - Admin enters final score (home/away).
+  - Winner is determined by the last digit of each team score:
+    - Home score last digit maps to row label.
+    - Away score last digit maps to column label.
+  - Intersecting square owner is announced as the winner.
 
 **State & Persistence**
 - When running `npm run dev` locally, app state is persisted to SQLite (`.data/board-state.sqlite`) via a Vite dev API.
@@ -98,6 +108,7 @@ Prerequisite: Node.js
 2. Set environment variables in `.env.local` (if required by your environment):
    - `GEMINI_API_KEY=YOUR_KEY`
    - `VITE_ADMIN_PASSCODE=YOUR_PASSCODE`
+   - Optional: `VITE_GAME_DATE=2026-02-08` (defaults to this date if omitted; final-score entry opens at 10:00 PM local time)
    - Optional: `VITE_USE_LOCAL_SQLITE=false` to disable SQLite in local dev
 3. Run the dev server:
    `npm run dev`
