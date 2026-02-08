@@ -24,7 +24,8 @@ import { EditModal } from "./components/EditModal";
 import { AuthModal } from "./components/AuthModal";
 import { WinnerModal } from "./components/WinnerModal";
 import { INITIAL_COLS, INITIAL_ROWS } from "./constants";
-import { GameResult, GridCell } from "./types";
+import { buildSquareOdds } from "./services/squareOddsService";
+import { GameResult, GridCell, SquareOddsComputationResult } from "./types";
 import { isSupabaseConfigured, supabase } from "./supabaseClient";
 
 const STORAGE_KEY = "sb-lx-squares-v1";
@@ -49,6 +50,10 @@ const createEmptyGrid = (): GridCell[][] =>
           status: "empty" as const,
         })),
     );
+
+const PRE_LOCK_UNIFORM_ODDS: number[][] = Array.from({ length: 10 }, () =>
+  Array.from({ length: 10 }, () => 1),
+);
 
 type PersistedState = {
   version: 2;
@@ -303,6 +308,11 @@ const App: React.FC = () => {
     () =>
       persistedState?.gameResult ? String(persistedState.gameResult.awayScore) : "",
   );
+  const [squareOdds, setSquareOdds] = useState<SquareOddsComputationResult | null>(
+    null,
+  );
+  const [isSquareOddsLoading, setIsSquareOddsLoading] = useState(false);
+  const [squareOddsError, setSquareOddsError] = useState<string | null>(null);
 
   const adminPasscodeEnv = import.meta.env.VITE_ADMIN_PASSCODE;
   const isAdmin = !!adminPasscodeEnv && adminPasscode === adminPasscodeEnv;
@@ -332,6 +342,13 @@ const App: React.FC = () => {
     ? formatTimestamp(scoreUnlockAt)
     : "10:00 PM Sunday";
   const canFinalizeGame = isLocked;
+  const shouldComputeSquareOdds = isLocked && !gameResult;
+  const shouldShowSquareOdds = !gameResult;
+  const boardSquareOdds = useMemo(() => {
+    if (gameResult) return null;
+    if (!isLocked) return PRE_LOCK_UNIFORM_ODDS;
+    return squareOdds?.boardPercentages ?? null;
+  }, [gameResult, isLocked, squareOdds]);
 
   const applyPersistedState = useCallback((next: PersistedState) => {
     setPricePerSquare(next.pricePerSquare);
@@ -351,6 +368,50 @@ const App: React.FC = () => {
     setAwayFinalScore(String(gameResult.awayScore));
     setIsWinnerModalOpen(true);
   }, [gameResult, isLandingPath]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!shouldComputeSquareOdds) {
+      setIsSquareOddsLoading(false);
+      setSquareOddsError(null);
+      setSquareOdds(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setIsSquareOddsLoading(true);
+    setSquareOddsError(null);
+
+    buildSquareOdds({
+      homeTeamName: homeTeam,
+      awayTeamName: awayTeam,
+      rowLabels,
+      colLabels,
+    })
+      .then((result) => {
+        if (cancelled) return;
+        setSquareOdds(result);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setSquareOddsError(
+          error instanceof Error
+            ? error.message
+            : "Could not compute square probability model.",
+        );
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsSquareOddsLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [shouldComputeSquareOdds, homeTeam, awayTeam, rowLabels, colLabels]);
 
   useEffect(() => {
     if (!SHOULD_USE_LOCAL_SQLITE) return;
@@ -598,6 +659,14 @@ const App: React.FC = () => {
     homeFinalScore.trim() === "" &&
     awayFinalScore.trim() === "" &&
     !finalizeError;
+  const squareOddsGeneratedText = squareOdds
+    ? formatTimestamp(new Date(squareOdds.generatedAt))
+    : null;
+  const squareOddsStatusMessage = squareOdds
+    ? squareOdds.sourceMode === "full"
+      ? "Smart model active: historical scores + market lines + team APIs."
+      : "Baseline model active: live feeds unavailable, using historical/poisson fallback."
+    : null;
 
   // Actions
   const handleShuffle = useCallback(() => {
@@ -1080,6 +1149,46 @@ const App: React.FC = () => {
                   You are in admin mode. Click any square to assign it.
                 </p>
               )}
+              {shouldShowSquareOdds && (
+                <div className="mt-2 space-y-1">
+                  {!isLocked && (
+                    <p className="text-xs text-slate-300">
+                      Board is open: each square is an equal{" "}
+                      <span className="font-semibold text-white">1.00%</span> chance
+                      until the board is locked and numbers are revealed.
+                    </p>
+                  )}
+                  {isLocked && (
+                    <>
+                      {isSquareOddsLoading && (
+                        <p className="text-xs text-sky-300">
+                          Computing smart square probabilities and heatmap...
+                        </p>
+                      )}
+                      {!isSquareOddsLoading && squareOddsStatusMessage && (
+                        <p className="text-xs text-slate-300">{squareOddsStatusMessage}</p>
+                      )}
+                      {!isSquareOddsLoading && squareOdds && squareOddsGeneratedText && (
+                        <p className="text-[11px] text-slate-500">
+                          Generated {squareOddsGeneratedText}. Projected final points:{" "}
+                          {homeTeam} {squareOdds.expectedHomePoints.toFixed(1)} /{" "}
+                          {awayTeam} {squareOdds.expectedAwayPoints.toFixed(1)}.
+                        </p>
+                      )}
+                      {!isSquareOddsLoading && squareOdds?.warnings?.[0] && (
+                        <p className="text-[11px] text-amber-300">
+                          Model note: {squareOdds.warnings[0]}
+                        </p>
+                      )}
+                      {squareOddsError && (
+                        <p className="text-[11px] text-red-300">
+                          Could not refresh smart odds: {squareOddsError}
+                        </p>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
             </div>
             <div className="text-left sm:text-right">
               <span className="text-3xl font-bold text-emerald-400">
@@ -1100,6 +1209,9 @@ const App: React.FC = () => {
             awayTeamName={awayTeam}
             isAdmin={isAdmin}
             isLocked={isLocked}
+            showSquareOdds={shouldShowSquareOdds}
+            isSquareOddsLoading={shouldComputeSquareOdds && isSquareOddsLoading}
+            squareOddsPercentages={boardSquareOdds}
             winningCell={
               gameResult
                 ? {

@@ -12,8 +12,57 @@ interface GridBoardProps {
   awayTeamName: string;
   isAdmin: boolean;
   isLocked: boolean;
+  showSquareOdds?: boolean;
+  isSquareOddsLoading?: boolean;
+  squareOddsPercentages?: number[][] | null;
   winningCell?: { row: number; col: number } | null;
 }
+
+const clamp = (value: number, min: number, max: number): number =>
+  Math.min(max, Math.max(min, value));
+
+const HEAT_COLOR_STOPS: Array<{ t: number; rgb: [number, number, number] }> = [
+  { t: 0, rgb: [127, 29, 29] },
+  { t: 0.22, rgb: [185, 28, 28] },
+  { t: 0.45, rgb: [234, 88, 12] },
+  { t: 0.67, rgb: [250, 204, 21] },
+  { t: 0.85, rgb: [132, 204, 22] },
+  { t: 1, rgb: [34, 197, 94] },
+];
+
+const HEAT_LEGEND_GRADIENT =
+  "linear-gradient(90deg, #7f1d1d 0%, #b91c1c 22%, #ea580c 45%, #facc15 67%, #84cc16 85%, #22c55e 100%)";
+
+const interpolateHeatRgb = (normalized: number): [number, number, number] => {
+  const value = clamp(normalized, 0, 1);
+
+  for (let i = 0; i < HEAT_COLOR_STOPS.length - 1; i += 1) {
+    const start = HEAT_COLOR_STOPS[i];
+    const end = HEAT_COLOR_STOPS[i + 1];
+    if (value < start.t || value > end.t) continue;
+
+    const span = Math.max(end.t - start.t, 0.0001);
+    const factor = (value - start.t) / span;
+    const mix = (from: number, to: number) =>
+      Math.round(from + (to - from) * factor);
+
+    return [
+      mix(start.rgb[0], end.rgb[0]),
+      mix(start.rgb[1], end.rgb[1]),
+      mix(start.rgb[2], end.rgb[2]),
+    ];
+  }
+
+  return HEAT_COLOR_STOPS[HEAT_COLOR_STOPS.length - 1].rgb;
+};
+
+const getHeatRgba = (normalized: number, alpha: number): string => {
+  const [r, g, b] = interpolateHeatRgb(normalized);
+  return `rgba(${r}, ${g}, ${b}, ${clamp(alpha, 0, 1)})`;
+};
+
+const getHeatOverlay = (normalized: number): string =>
+  getHeatRgba(normalized, 0.14 + normalized * 0.22);
 
 export const GridBoard: React.FC<GridBoardProps> = ({
   rowLabels,
@@ -24,10 +73,22 @@ export const GridBoard: React.FC<GridBoardProps> = ({
   awayTeamName,
   isAdmin,
   isLocked,
+  showSquareOdds = false,
+  isSquareOddsLoading = false,
+  squareOddsPercentages = null,
   winningCell = null,
 }) => {
   const homeLogo = getTeamLogo(homeTeamName);
   const awayLogo = getTeamLogo(awayTeamName);
+  const showOdds = showSquareOdds;
+
+  const flattenedOdds = showOdds && squareOddsPercentages
+    ? squareOddsPercentages.flat().filter((value) => Number.isFinite(value))
+    : [];
+  const minOdds = flattenedOdds.length > 0 ? Math.min(...flattenedOdds) : 0;
+  const maxOdds = flattenedOdds.length > 0 ? Math.max(...flattenedOdds) : 0;
+  const isUniformOdds = flattenedOdds.length > 0 && Math.abs(maxOdds - minOdds) < 0.0001;
+  const oddsRange = Math.max(maxOdds - minOdds, 0.0001);
 
   const renderSquare = (
     cell: GridCell,
@@ -40,6 +101,19 @@ export const GridBoard: React.FC<GridBoardProps> = ({
     const hasPlayer = Boolean(cell.player);
     const squareNumber = rIndex * 10 + cIndex + 1;
     const isWinner = winningCell?.row === rIndex && winningCell?.col === cIndex;
+    const oddsValue = showOdds ? squareOddsPercentages?.[rIndex]?.[cIndex] : null;
+    const hasOddsValue = typeof oddsValue === "number" && Number.isFinite(oddsValue);
+    const normalizedOdds = hasOddsValue
+      ? clamp((oddsValue - minOdds) / oddsRange, 0, 1)
+      : 0;
+    const heatOverlay =
+      hasOddsValue && !isUniformOdds ? getHeatOverlay(normalizedOdds) : null;
+    const oddsText =
+      hasOddsValue && oddsValue !== null ? `${oddsValue.toFixed(2)}%` : "--";
+    const oddsBadgeStyle =
+      hasOddsValue && !isUniformOdds
+        ? { borderColor: getHeatRgba(normalizedOdds, 0.62) }
+        : undefined;
 
     return (
       <button
@@ -60,9 +134,16 @@ export const GridBoard: React.FC<GridBoardProps> = ({
           ${isWinner ? "ring-2 ring-amber-400 ring-offset-1 ring-offset-slate-900" : ""}
         `}
       >
+        {showOdds && heatOverlay && (
+          <div
+            className="pointer-events-none absolute inset-0 rounded-lg"
+            style={{ backgroundColor: heatOverlay }}
+          />
+        )}
+
         {hasPlayer ? (
           <>
-            <div className="w-full h-full flex items-center justify-center">
+            <div className="w-full h-full flex items-center justify-center relative z-10">
               <span
                 className={`
                   font-semibold text-center break-words leading-tight w-full px-1
@@ -75,18 +156,18 @@ export const GridBoard: React.FC<GridBoardProps> = ({
             </div>
 
             {isAdmin && isPending && (
-              <div className="absolute top-1 right-1">
+              <div className="absolute top-1 right-1 z-20">
                 <AlertCircle className={compact ? "w-2.5 h-2.5 text-yellow-500" : "w-3 h-3 text-yellow-500"} />
               </div>
             )}
             {isAdmin && isApproved && (
-              <div className="absolute top-1 right-1 opacity-20">
+              <div className="absolute top-1 right-1 opacity-20 z-20">
                 <CheckCircle2 className={compact ? "w-2.5 h-2.5 text-emerald-500" : "w-3 h-3 text-emerald-500"} />
               </div>
             )}
           </>
         ) : (
-          <div className="w-full h-full flex items-center justify-center">
+          <div className="w-full h-full flex items-center justify-center relative z-10">
             <span
               className={`font-bold text-slate-700/50 select-none group-hover:text-slate-600 transition-colors ${
                 compact ? "text-lg" : "text-3xl"
@@ -97,8 +178,23 @@ export const GridBoard: React.FC<GridBoardProps> = ({
           </div>
         )}
 
+        {showOdds && (
+          <div
+            className="pointer-events-none absolute left-1 bottom-1 z-20 rounded bg-slate-950/85 border border-slate-700/70 px-1 py-0.5 leading-none"
+            style={oddsBadgeStyle}
+          >
+            <span
+              className={`font-semibold tracking-tight ${
+                compact ? "text-[8px]" : "text-[9px]"
+              } text-slate-200`}
+            >
+              {isSquareOddsLoading ? "..." : oddsText}
+            </span>
+          </div>
+        )}
+
         {isWinner && (
-          <div className="pointer-events-none absolute left-1 top-1 rounded-full bg-amber-400/90 p-0.5 text-slate-950">
+          <div className="pointer-events-none absolute left-1 top-1 rounded-full bg-amber-400/90 p-0.5 text-slate-950 z-20">
             <Trophy className={compact ? "h-2.5 w-2.5" : "h-3 w-3"} />
           </div>
         )}
@@ -108,6 +204,26 @@ export const GridBoard: React.FC<GridBoardProps> = ({
 
   return (
     <div className="w-full">
+      {showOdds && (
+        <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div className="text-xs text-slate-400">
+            {isUniformOdds
+              ? "All squares are currently even at 1.00% until board lock."
+              : "Heatmap overlays each square's estimated win probability."}
+          </div>
+          {!isUniformOdds && (
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] uppercase tracking-wider text-slate-500">Low</span>
+              <div
+                className="h-2.5 w-32 rounded-full border border-slate-700/80"
+                style={{ background: HEAT_LEGEND_GRADIENT }}
+              />
+              <span className="text-[10px] uppercase tracking-wider text-slate-500">High</span>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Mobile / Small screens */}
       <div className="md:hidden w-full overflow-x-auto grid-scroll pb-4">
         <div className="min-w-[560px]">

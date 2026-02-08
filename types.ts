@@ -35,3 +35,25 @@ export interface GameSettings {
   homeTeamName: string;
   awayTeamName: string;
 }
+
+export type DigitProbabilityMatrix = number[][];
+
+export type SquareOddsSourceMode = "full" | "baseline";
+
+export type SquareOddsComputationSource =
+  | "nflverse_games"
+  | "nflverse_closing_lines"
+  | "espn_team_stats"
+  | "thesportsdb_recent_form"
+  | "fallback_model";
+
+export interface SquareOddsComputationResult {
+  boardPercentages: number[][];
+  digitProbabilities: DigitProbabilityMatrix;
+  generatedAt: string;
+  sourceMode: SquareOddsSourceMode;
+  sourcesUsed: SquareOddsComputationSource[];
+  warnings: string[];
+  expectedHomePoints: number;
+  expectedAwayPoints: number;
+}
