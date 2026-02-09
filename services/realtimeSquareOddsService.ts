@@ -127,6 +127,188 @@ const samplePoisson = (lambda: number, rng: () => number): number => {
   return Math.max(0, count - 1);
 };
 
+type ScoringOutcomeWeight = {
+  points: number;
+  weight: number;
+};
+
+type ScoringOutcomeProbability = {
+  points: number;
+  probability: number;
+};
+
+type TeamScoringSimulationProfile = {
+  expectedScoringEvents: number;
+  scoringOutcomes: ScoringOutcomeProbability[];
+};
+
+const normalizeScoringOutcomeWeights = (
+  outcomes: ScoringOutcomeWeight[],
+): ScoringOutcomeProbability[] => {
+  const positive = outcomes.filter(
+    (outcome) =>
+      Number.isFinite(outcome.points) &&
+      outcome.points > 0 &&
+      Number.isFinite(outcome.weight) &&
+      outcome.weight > 0,
+  );
+
+  if (positive.length === 0) {
+    return [
+      { points: 3, probability: 0.34 },
+      { points: 7, probability: 0.51 },
+      { points: 8, probability: 0.06 },
+      { points: 6, probability: 0.06 },
+      { points: 2, probability: 0.03 },
+    ];
+  }
+
+  const totalWeight = positive.reduce((sum, outcome) => sum + outcome.weight, 0);
+  return positive.map((outcome) => ({
+    points: outcome.points,
+    probability: outcome.weight / totalWeight,
+  }));
+};
+
+const sampleScoringOutcomePoints = (
+  outcomes: ScoringOutcomeProbability[],
+  rng: () => number,
+): number => {
+  let remaining = rng();
+
+  for (const outcome of outcomes) {
+    remaining -= outcome.probability;
+    if (remaining <= 0) return outcome.points;
+  }
+
+  return outcomes[outcomes.length - 1]?.points ?? 0;
+};
+
+const estimateRemainingDrivesPerTeam = (
+  remainingSeconds: number,
+  playPacePerMinute: number,
+  trailingPressure: number,
+): number => {
+  const adjustedPace = clamp(playPacePerMinute, 1.2, 4.8);
+  const averagePlaysPerDrive = clamp(6 - trailingPressure * 0.9, 4.8, 6.2);
+  const estimatedDriveSeconds = (averagePlaysPerDrive / adjustedPace) * 60;
+  const drives = remainingSeconds / Math.max(estimatedDriveSeconds * 2, 90);
+  return clamp(drives, 0.35, 13);
+};
+
+const buildTeamScoringProfile = (input: {
+  expectedAdditionalPoints: number;
+  ownMomentum: number;
+  opponentMomentum: number;
+  ownScoringRate: number;
+  ownPenaltyPressure: number;
+  ownTurnoverPressure: number;
+  opponentTurnoverPressure: number;
+  playPacePerMinute: number;
+  remainingSeconds: number;
+  scoreDiff: number;
+}): TeamScoringSimulationProfile => {
+  const remainingRatio = clamp(
+    input.remainingSeconds / TOTAL_REGULATION_SECONDS,
+    0,
+    1,
+  );
+  const lateGameUrgency = clamp((12 * 60 - input.remainingSeconds) / (12 * 60), 0, 1);
+  const trailingPressure =
+    input.scoreDiff < 0 ? clamp(Math.abs(input.scoreDiff) / 17, 0, 1) : 0;
+  const leadingControl =
+    input.scoreDiff > 0 ? clamp(input.scoreDiff / 17, 0, 1) : 0;
+  const momentumEdge = clamp(input.ownMomentum - input.opponentMomentum, -2.8, 2.8);
+
+  let fieldGoalWeight =
+    0.34 +
+    input.ownPenaltyPressure * 0.07 +
+    leadingControl * (0.08 + lateGameUrgency * 0.06);
+  let touchdownXpWeight =
+    0.49 +
+    momentumEdge * 0.05 +
+    input.ownScoringRate * 0.2 -
+    input.ownPenaltyPressure * 0.05;
+  let touchdownTwoPointWeight =
+    0.04 +
+    trailingPressure * lateGameUrgency * 0.22 +
+    Math.max(0, momentumEdge) * 0.02;
+  let touchdownMissedXpWeight = 0.03 + input.ownPenaltyPressure * 0.02;
+  let safetyWeight =
+    0.01 +
+    input.opponentTurnoverPressure * 0.03 +
+    trailingPressure * lateGameUrgency * 0.025;
+  let defensiveTouchdownWeight =
+    0.02 +
+    input.opponentTurnoverPressure * 0.08 +
+    Math.max(0, momentumEdge) * 0.01;
+
+  if (input.remainingSeconds <= 3 * 60 && trailingPressure >= 0.2) {
+    touchdownTwoPointWeight += 0.08;
+    fieldGoalWeight *= 0.9;
+  }
+
+  if (input.remainingSeconds <= 2 * 60 && leadingControl >= 0.2) {
+    fieldGoalWeight += 0.1;
+    touchdownTwoPointWeight *= 0.65;
+  }
+
+  fieldGoalWeight = clamp(fieldGoalWeight, 0.15, 0.62);
+  touchdownXpWeight = clamp(touchdownXpWeight, 0.22, 0.72);
+  touchdownTwoPointWeight = clamp(touchdownTwoPointWeight, 0.01, 0.24);
+  touchdownMissedXpWeight = clamp(touchdownMissedXpWeight, 0.01, 0.08);
+  safetyWeight = clamp(safetyWeight, 0.003, 0.07);
+  defensiveTouchdownWeight = clamp(defensiveTouchdownWeight, 0.01, 0.14);
+
+  const scoringOutcomes = normalizeScoringOutcomeWeights([
+    { points: 3, weight: fieldGoalWeight },
+    { points: 7, weight: touchdownXpWeight + defensiveTouchdownWeight },
+    { points: 8, weight: touchdownTwoPointWeight },
+    { points: 6, weight: touchdownMissedXpWeight },
+    { points: 2, weight: safetyWeight },
+  ]);
+
+  const expectedPointsPerEvent = scoringOutcomes.reduce(
+    (sum, outcome) => sum + outcome.points * outcome.probability,
+    0,
+  );
+
+  const drivesPerTeam = estimateRemainingDrivesPerTeam(
+    input.remainingSeconds,
+    input.playPacePerMinute,
+    trailingPressure,
+  );
+
+  const rawExpectedEvents =
+    input.expectedAdditionalPoints / Math.max(expectedPointsPerEvent, 2.5);
+  const paceMultiplier = 1 + clamp(input.playPacePerMinute - 2.2, -1.2, 2.8) * 0.1;
+  const riskMultiplier =
+    1 + trailingPressure * lateGameUrgency * 0.25 - leadingControl * lateGameUrgency * 0.15;
+  const disruptionMultiplier = clamp(
+    1 - input.ownTurnoverPressure * 0.1 - input.ownPenaltyPressure * 0.05,
+    0.55,
+    1.15,
+  );
+  const momentumMultiplier = 1 + momentumEdge * 0.06;
+  const timeCompressionMultiplier = 1 + (1 - remainingRatio) * 0.08;
+
+  const expectedScoringEvents = clamp(
+    rawExpectedEvents *
+      paceMultiplier *
+      riskMultiplier *
+      disruptionMultiplier *
+      momentumMultiplier *
+      timeCompressionMultiplier,
+    0,
+    drivesPerTeam * 0.92,
+  );
+
+  return {
+    expectedScoringEvents,
+    scoringOutcomes,
+  };
+};
+
 const buildFeatureVector = (snapshot: LiveGameSnapshot): LiveFeatureVector => {
   const remainingGameSeconds =
     snapshot.clock.secondsRemainingGame ??
@@ -294,10 +476,64 @@ const buildSimulationMatrix = (
 
   const rng = createSeededRandom(hashString(seedBasis));
   const matrix = createZeroMatrix();
+  const scoreDiff = snapshot.homeScore - snapshot.awayScore;
+
+  const homeProfile = buildTeamScoringProfile({
+    expectedAdditionalPoints: expectedHomeAdditionalPoints,
+    ownMomentum: featureVector.homeMomentum,
+    opponentMomentum: featureVector.awayMomentum,
+    ownScoringRate: featureVector.homeRecentScoringRate,
+    ownPenaltyPressure: featureVector.homePenaltyPressure,
+    ownTurnoverPressure: featureVector.homeTurnoverPressure,
+    opponentTurnoverPressure: featureVector.awayTurnoverPressure,
+    playPacePerMinute: featureVector.playPacePerMinute,
+    remainingSeconds: featureVector.remainingGameSeconds,
+    scoreDiff,
+  });
+
+  const awayProfile = buildTeamScoringProfile({
+    expectedAdditionalPoints: expectedAwayAdditionalPoints,
+    ownMomentum: featureVector.awayMomentum,
+    opponentMomentum: featureVector.homeMomentum,
+    ownScoringRate: featureVector.awayRecentScoringRate,
+    ownPenaltyPressure: featureVector.awayPenaltyPressure,
+    ownTurnoverPressure: featureVector.awayTurnoverPressure,
+    opponentTurnoverPressure: featureVector.homeTurnoverPressure,
+    playPacePerMinute: featureVector.playPacePerMinute,
+    remainingSeconds: featureVector.remainingGameSeconds,
+    scoreDiff: -scoreDiff,
+  });
 
   for (let i = 0; i < simulationRuns; i += 1) {
-    const homeAdditional = samplePoisson(expectedHomeAdditionalPoints, rng);
-    const awayAdditional = samplePoisson(expectedAwayAdditionalPoints, rng);
+    let homeAdditional = 0;
+    let awayAdditional = 0;
+
+    const homeEventCount = samplePoisson(homeProfile.expectedScoringEvents, rng);
+    const awayEventCount = samplePoisson(awayProfile.expectedScoringEvents, rng);
+
+    for (let eventIndex = 0; eventIndex < homeEventCount; eventIndex += 1) {
+      homeAdditional += sampleScoringOutcomePoints(homeProfile.scoringOutcomes, rng);
+    }
+
+    for (let eventIndex = 0; eventIndex < awayEventCount; eventIndex += 1) {
+      awayAdditional += sampleScoringOutcomePoints(awayProfile.scoringOutcomes, rng);
+    }
+
+    // Late game one-possession scenario: trailing team gets a final high-leverage chance.
+    if (remaining <= 2 * 60 && rng() < 0.28) {
+      const projectedHome = snapshot.homeScore + homeAdditional;
+      const projectedAway = snapshot.awayScore + awayAdditional;
+
+      if (projectedHome < projectedAway) {
+        homeAdditional += sampleScoringOutcomePoints(homeProfile.scoringOutcomes, rng);
+      } else if (projectedAway < projectedHome) {
+        awayAdditional += sampleScoringOutcomePoints(awayProfile.scoringOutcomes, rng);
+      } else if (rng() < 0.5) {
+        homeAdditional += sampleScoringOutcomePoints(homeProfile.scoringOutcomes, rng);
+      } else {
+        awayAdditional += sampleScoringOutcomePoints(awayProfile.scoringOutcomes, rng);
+      }
+    }
 
     const homeDigit = (snapshot.homeScore + homeAdditional) % DIGIT_COUNT;
     const awayDigit = (snapshot.awayScore + awayAdditional) % DIGIT_COUNT;
@@ -321,37 +557,67 @@ const estimateAdditionalPoints = (
   elapsedSeconds: number,
   scoreDiff: number,
 ): number => {
+  const remainingRatio = clamp(remainingSeconds / TOTAL_REGULATION_SECONDS, 0, 1);
+  const elapsedRatio = clamp(elapsedSeconds / TOTAL_REGULATION_SECONDS, 0, 1);
   const baseRatePerSecond = baseExpectedPoints / TOTAL_REGULATION_SECONDS;
   const observedRatePerSecond =
-    currentScore / Math.max(elapsedSeconds, 18 * 60);
+    currentScore / Math.max(elapsedSeconds, 8 * 60);
 
-  const liveBlendWeight = clamp(elapsedSeconds / (2.2 * 60 * 60), 0.2, 0.9);
+  const currentScoreWeight = clamp(
+    0.4 + elapsedRatio * 0.38 + (1 - remainingRatio) * 0.3,
+    0.35,
+    0.97,
+  );
   let projectedRate =
-    baseRatePerSecond * (1 - liveBlendWeight) + observedRatePerSecond * liveBlendWeight;
+    baseRatePerSecond * (1 - currentScoreWeight) +
+    observedRatePerSecond * currentScoreWeight;
 
-  projectedRate *= 1 + ownMomentum * 0.075;
-  projectedRate *= 1 + ownScoringRate * 0.28;
-  projectedRate *= 1 + clamp(playPacePerMinute - 2.2, -1.4, 2.2) * 0.08;
+  projectedRate *= 1 + ownMomentum * 0.085;
+  projectedRate *= 1 + ownScoringRate * 0.32;
+  projectedRate *= 1 + clamp(playPacePerMinute - 2.2, -1.4, 2.2) * 0.09;
+  projectedRate *= 1 + (1 - remainingRatio) * 0.1;
 
   projectedRate *= 1 - ownPenaltyPressure * 0.22;
-  projectedRate *= 1 - ownTurnoverPressure * 0.32;
-  projectedRate *= 1 - clamp(opponentMomentum, -1.5, 2.5) * 0.05;
+  projectedRate *= 1 - ownTurnoverPressure * 0.34;
+  projectedRate *= 1 - clamp(opponentMomentum, -1.5, 2.5) * 0.055;
 
-  if (remainingSeconds <= 8 * 60 && scoreDiff < 0) {
-    projectedRate *= 1 + clamp(Math.abs(scoreDiff) / 16, 0, 0.34);
+  if (remainingSeconds <= 9 * 60 && scoreDiff < 0) {
+    projectedRate *= 1 + clamp(Math.abs(scoreDiff) / 15, 0, 0.4);
   }
 
-  if (remainingSeconds <= 6 * 60 && scoreDiff > 0) {
-    projectedRate *= 1 - clamp(scoreDiff / 20, 0, 0.25);
+  if (remainingSeconds <= 7 * 60 && scoreDiff > 0) {
+    projectedRate *= 1 - clamp(scoreDiff / 18, 0, 0.3);
   }
 
   const expectedAdditional = projectedRate * remainingSeconds;
-  return clamp(expectedAdditional, 0, 35);
+  const contextualCap = clamp(12 + baseExpectedPoints * (remainingRatio * 1.1 + 0.35), 16, 42);
+  return clamp(expectedAdditional, 0, contextualCap);
 };
 
-const getLiveBlendWeight = (featureVector: LiveFeatureVector): number => {
+const getLiveBlendWeight = (
+  featureVector: LiveFeatureVector,
+  snapshot: LiveGameSnapshot,
+): number => {
+  if (snapshot.status === "pregame") return 0.2;
+
   const elapsedRatio = clamp(
     featureVector.elapsedGameSeconds / TOTAL_REGULATION_SECONDS,
+    0,
+    1,
+  );
+  const remainingRatio = clamp(
+    featureVector.remainingGameSeconds / TOTAL_REGULATION_SECONDS,
+    0,
+    1,
+  );
+  const scoreSignal = clamp((snapshot.homeScore + snapshot.awayScore) / 56, 0, 1);
+  const scoreDiffSignal = clamp(
+    Math.abs(snapshot.homeScore - snapshot.awayScore) / 21,
+    0,
+    1,
+  );
+  const lateGamePressure = clamp(
+    (12 * 60 - featureVector.remainingGameSeconds) / (12 * 60),
     0,
     1,
   );
@@ -360,7 +626,15 @@ const getLiveBlendWeight = (featureVector: LiveFeatureVector): number => {
   if (featureVector.remainingGameSeconds <= 5 * 60) return 0.95;
   if (featureVector.remainingGameSeconds <= 10 * 60) return 0.9;
 
-  return clamp(0.32 + elapsedRatio * 0.58, 0.32, 0.9);
+  const blendedWeight =
+    0.36 +
+    elapsedRatio * 0.34 +
+    (1 - remainingRatio) * 0.27 +
+    scoreSignal * 0.1 +
+    scoreDiffSignal * 0.05 +
+    lateGamePressure * 0.08;
+
+  return clamp(blendedWeight, 0.36, 0.95);
 };
 
 const appendUniqueSources = (
@@ -379,7 +653,13 @@ export const buildRealtimeSquareOdds = (
   const featureVector = buildFeatureVector(input.snapshot);
 
   let liveDigitMatrix: DigitProbabilityMatrix;
-  let liveBlendWeight = getLiveBlendWeight(featureVector);
+  let liveBlendWeight = getLiveBlendWeight(featureVector, input.snapshot);
+  let expectedHomeAdditional =
+    (featureVector.remainingGameSeconds / TOTAL_REGULATION_SECONDS) *
+    input.baseModel.expectedHomePoints;
+  let expectedAwayAdditional =
+    (featureVector.remainingGameSeconds / TOTAL_REGULATION_SECONDS) *
+    input.baseModel.expectedAwayPoints;
 
   if (input.snapshot.status === "final" || input.snapshot.status === "postponed") {
     liveDigitMatrix = buildDeterministicFinalMatrix(
@@ -387,10 +667,12 @@ export const buildRealtimeSquareOdds = (
       input.snapshot.awayScore,
     );
     liveBlendWeight = 1;
+    expectedHomeAdditional = 0;
+    expectedAwayAdditional = 0;
   } else {
     const scoreDiff = input.snapshot.homeScore - input.snapshot.awayScore;
 
-    const expectedHomeAdditional = estimateAdditionalPoints(
+    expectedHomeAdditional = estimateAdditionalPoints(
       input.baseModel.expectedHomePoints,
       input.snapshot.homeScore,
       featureVector.homeMomentum,
@@ -404,7 +686,7 @@ export const buildRealtimeSquareOdds = (
       scoreDiff,
     );
 
-    const expectedAwayAdditional = estimateAdditionalPoints(
+    expectedAwayAdditional = estimateAdditionalPoints(
       input.baseModel.expectedAwayPoints,
       input.snapshot.awayScore,
       featureVector.awayMomentum,
@@ -436,15 +718,14 @@ export const buildRealtimeSquareOdds = (
     mapDigitMatrixToBoard(digitProbabilities, input.rowLabels, input.colLabels),
   );
 
+  const liveExpectationWeight = clamp(0.08 + liveBlendWeight * 0.92, 0.08, 1);
+
   const expectedHomePoints =
     liveBlendWeight >= 0.999
       ? input.snapshot.homeScore
       : clamp(
-          input.baseModel.expectedHomePoints * (1 - liveBlendWeight) +
-            (input.snapshot.homeScore +
-              (featureVector.remainingGameSeconds / TOTAL_REGULATION_SECONDS) *
-                input.baseModel.expectedHomePoints) *
-              liveBlendWeight,
+          input.baseModel.expectedHomePoints * (1 - liveExpectationWeight) +
+            (input.snapshot.homeScore + expectedHomeAdditional) * liveExpectationWeight,
           0,
           70,
         );
@@ -453,11 +734,8 @@ export const buildRealtimeSquareOdds = (
     liveBlendWeight >= 0.999
       ? input.snapshot.awayScore
       : clamp(
-          input.baseModel.expectedAwayPoints * (1 - liveBlendWeight) +
-            (input.snapshot.awayScore +
-              (featureVector.remainingGameSeconds / TOTAL_REGULATION_SECONDS) *
-                input.baseModel.expectedAwayPoints) *
-              liveBlendWeight,
+          input.baseModel.expectedAwayPoints * (1 - liveExpectationWeight) +
+            (input.snapshot.awayScore + expectedAwayAdditional) * liveExpectationWeight,
           0,
           70,
         );
